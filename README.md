@@ -2,13 +2,9 @@
 
 A free, installable web app for planning a sailing course and navigating to mark positions on an iPhone.
 
-## Install / publish (GitHub Pages)
-
-1. Create a **public** GitHub repository named `buoyplot` (or another name).
-2. Upload every file in this folder into the repository root, including `index.html`, `app.js`, `styles.css`, icons, `sw.js` and `manifest.webmanifest`.
-3. Open the repository's **Settings > Pages**. Under **Build and deployment**, choose **Deploy from a branch**, the `main` branch and the `/ (root)` folder, then save.
-4. Open `https://YOUR-USERNAME.github.io/buoyplot/` on the iPhone using Safari. Your actual URL uses your selected repository name.
-5. In Safari, use **Share > Add to Home Screen** and enable **Open as Web App** if offered. Allow location access when prompted.
+## Install
+1. Open `https://staple3791.github.io/BouyPlot/` on the iPhone using Safari. Your actual URL uses your selected repository name.
+2. In Safari, use **Share > Add to Home Screen** and enable **Open as Web App** if offered. Allow location access when prompted.
 
 GPS location requires a secure (HTTPS) origin. Opening `index.html` as a local `file://` page is useful for viewing but may not allow GPS or service workers. GitHub Pages serves over HTTPS.
 
