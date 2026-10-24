@@ -13,8 +13,8 @@ const ctx = canvas.getContext('2d');
 const uid = () => (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const POINT_TYPES=['buoy','pin','boat'];
 const normalizeType=type=>POINT_TYPES.includes(type)?type:'buoy';
-const defaultLayout=()=>({windFrom:45,windVisible:true,lineLength:80,legLength:350,leewardOffset:50});
-const normalizeLayout=x=>({windFrom:Number.isFinite(Number(x?.windFrom))?((Math.round(Number(x.windFrom))%360)+360)%360:45,windVisible:x?.windVisible!==false,lineLength:validLength(x?.lineLength,10,2000,80),legLength:validLength(x?.legLength,10,10000,350),leewardOffset:validLength(x?.leewardOffset,0,2000,50)});
+const defaultLayout=()=>({windFrom:45,windVisible:true,lineLength:80,legLength:350,leewardOffset:50,autoAlignMarks:true,squareToWind:false});
+const normalizeLayout=x=>({windFrom:Number.isFinite(Number(x?.windFrom))?((Math.round(Number(x.windFrom))%360)+360)%360:45,windVisible:x?.windVisible!==false,lineLength:validLength(x?.lineLength,10,2000,80),legLength:validLength(x?.legLength,10,10000,350),leewardOffset:validLength(x?.leewardOffset,0,2000,50),autoAlignMarks:x?.autoAlignMarks!==false,squareToWind:x?.squareToWind===true});
 function validLength(value,min,max,fallback){const n=Number(value);return Number.isFinite(n)&&n>=min&&n<=max?n:fallback;}
 const freshCourse = name => ({id:uid(), name, marks:[],layout:defaultLayout()});
 const baseState = () => {const course = freshCourse('My sailing course'); return {version:2,courses:[course], activeCourseId:course.id};};
@@ -39,7 +39,7 @@ let state = loadState();
 const getCourse = () => state.courses.find(c=>c.id===state.activeCourseId) || state.courses[0];
 const getMark = () => getCourse().marks.find(m=>m.id===selectedId) || null;
 let selectedId = null;
-let mode = 'browse'; // browse, add, move
+let mode = 'browse'; // browse, add, move, course
 let view = {...DEFAULT_VIEW};
 let mapWidth = 400;
 let mapHeight = 400;
@@ -59,6 +59,67 @@ const windCtx=windCanvas.getContext('2d');
 let windLast=0;
 let windTick=0;
 let windAnimationId=0;
+let sheetState='peek';
+let sheetDrag=null;
+const SHEET_STATES=['peek','half','full'];
+function sheetHeights(){
+  const h=$('workspace').clientHeight||700;
+  const peek=104,full=Math.max(peek+60,h-10);
+  return {peek,half:Math.min(full-90,Math.max(peek+85,Math.round(h*.48))),full};
+}
+function visibleSheetHeight(){return window.innerWidth<=760?sheetHeights()[sheetState]:0;}
+function visibleMapHeight(){return window.innerWidth<=760?Math.max(120,mapHeight-visibleSheetHeight()):mapHeight;}
+function mapCenterY(){return visibleMapHeight()/2;}
+function setSheetState(next){
+  if(!SHEET_STATES.includes(next))return;
+  sheetState=next;
+  const height=sheetHeights()[sheetState];
+  $('workspace').style.setProperty('--sheet-visible',height+'px');
+  $('workspace').dataset.sheet=sheetState;
+  $('sheetHandle').setAttribute('aria-expanded',String(sheetState!=='peek'));
+  $('sheetHandle').setAttribute('aria-label',sheetState==='full'?'Collapse course controls':'Expand course controls');
+  requestRender();
+}
+function cycleSheet(){setSheetState(sheetState==='peek'?'half':sheetState==='half'?'full':'peek');}
+function updateSheetSummary(){
+  const mark=getMark();
+  $('sheetSummary').textContent=mark?mark.name:'Swipe up to plan your course';
+  $('sheetMiniNav').textContent=mark&&gpsPoint?formatDist(distanceMeters(gpsPoint,mark)):getCourse().marks.length+' points';
+}
+const sheetHandle=$('sheetHandle');
+sheetHandle.addEventListener('pointerdown',e=>{
+  if(window.innerWidth>760)return;
+  e.preventDefault();sheetHandle.setPointerCapture(e.pointerId);
+  sheetDrag={id:e.pointerId,y:e.clientY,initial:sheetHeights()[sheetState],current:sheetHeights()[sheetState],moved:false};
+  $('workspace').classList.add('sheet-dragging');
+});
+sheetHandle.addEventListener('pointermove',e=>{
+  if(!sheetDrag||e.pointerId!==sheetDrag.id)return;
+  const heights=sheetHeights();
+  sheetDrag.current=Math.max(heights.peek,Math.min(heights.full,sheetDrag.initial+sheetDrag.y-e.clientY));
+  if(Math.abs(e.clientY-sheetDrag.y)>9)sheetDrag.moved=true;
+  $('workspace').style.setProperty('--sheet-visible',sheetDrag.current+'px');
+  requestRender();
+});
+function endSheetPointer(e){
+  if(!sheetDrag||sheetDrag.id!==e.pointerId)return;
+  const previous=sheetDrag;
+  sheetDrag=null;
+  $('workspace').classList.remove('sheet-dragging');
+  if(!previous.moved){cycleSheet();return;}
+  const heights=sheetHeights();
+  const nearest=SHEET_STATES.reduce((a,b)=>Math.abs(heights[a]-previous.current)<Math.abs(heights[b]-previous.current)?a:b);
+  setSheetState(nearest);
+}
+sheetHandle.addEventListener('pointerup',endSheetPointer);
+sheetHandle.addEventListener('pointercancel',endSheetPointer);
+sheetHandle.addEventListener('keydown',e=>{
+  if(!['Enter',' ','ArrowDown','ArrowUp'].includes(e.key))return;
+  e.preventDefault();
+  if(e.key==='ArrowDown')setSheetState(sheetState==='full'?'half':'peek');
+  else if(e.key==='ArrowUp')setSheetState(sheetState==='peek'?'half':'full');
+  else cycleSheet();
+});
 
 function save() {
   try { localStorage.setItem(STORAGE_KEY,JSON.stringify(state)); }
@@ -135,7 +196,13 @@ function updateUI() {
     $('laidButton').textContent=selected.laid?'Clear position record':selected.type==='boat'?'Record boat here':'Record mark laid here';
     $('laidDetail').textContent=selected.laid ? `Recorded at ${prettyCoord(selected.laid.lat)}, ${prettyCoord(selected.laid.lon)}. Offset: ${formatDist(distanceMeters(selected, selected.laid))}.` : selected.type==='boat'?'Record the boat’s actual GPS position once anchored, if useful.':'When you lay the mark, record its actual GPS position to compare with the plan.';
   }
-  renderList(); updateNavigation(); updateGpsStatus(); requestRender();
+  $('courseDragButton').classList.toggle('active',mode==='course');
+  $('courseDragButton').setAttribute('aria-pressed',String(mode==='course'));
+  $('planModeToggle').classList.toggle('active',mode==='course');
+  $('planModeToggle').setAttribute('aria-pressed',String(mode==='course'));
+  $('planModeToggle').textContent=mode==='course'?'Move course: On':'Move course: Off';
+  if(mode==='course'){$('mapInstruction').hidden=false;$('mapInstruction').textContent='Drag the start line to move the start boat, pin and linked W/L marks together.';}
+  renderList(); updateNavigation(); updateGpsStatus(); updateSheetSummary();requestRender();
 }
 function renderList() {
   const list=$('markList');list.innerHTML='';
@@ -204,11 +271,11 @@ function mapPoint(lat,lon) {
   let dx=p.x-c.x;
   if(dx>worldWidth/2)dx-=worldWidth;
   if(dx<-worldWidth/2)dx+=worldWidth;
-  return {x:mapWidth/2+dx,y:mapHeight/2+p.y-c.y};
+  return {x:mapWidth/2+dx,y:mapCenterY()+p.y-c.y};
 }
 function geoAt(x,y) {
   const center=worldPoint(view.lat,view.lon,view.zoom);
-  return geoPoint(center.x+x-mapWidth/2,center.y+y-mapHeight/2,view.zoom);
+  return geoPoint(center.x+x-mapWidth/2,center.y+y-mapCenterY(),view.zoom);
 }
 function setCenter(lat,lon) {view.lat=Math.max(-85,Math.min(85,lat));view.lon=((lon+180)%360+360)%360-180;requestRender();}
 function panBy(dx,dy) {
@@ -216,11 +283,11 @@ function panBy(dx,dy) {
   const dest=geoPoint(c.x-dx,c.y-dy,view.zoom);
   setCenter(dest.lat,dest.lon);followGPS=false;updateGpsStatus();
 }
-function changeZoom(delta,aroundX=mapWidth/2,aroundY=mapHeight/2) {
+function changeZoom(delta,aroundX=mapWidth/2,aroundY=mapCenterY()) {
   const next=Math.max(MIN_ZOOM,Math.min(MAX_ZOOM,view.zoom+delta));if(next===view.zoom)return;
   const anchor=geoAt(aroundX,aroundY);view.zoom=next;
   const anchorWorld=worldPoint(anchor.lat,anchor.lon,next);
-  const center=geoPoint(anchorWorld.x-(aroundX-mapWidth/2),anchorWorld.y-(aroundY-mapHeight/2),next);
+  const center=geoPoint(anchorWorld.x-(aroundX-mapWidth/2),anchorWorld.y-(aroundY-mapCenterY()),next);
   setCenter(center.lat,center.lon);
 }
 function resize() {
@@ -256,7 +323,7 @@ function draw() {
   ctx.clearRect(0,0,mapWidth,mapHeight);
   ctx.fillStyle='#deedf0';ctx.fillRect(0,0,mapWidth,mapHeight);
   const c=worldPoint(view.lat,view.lon,view.zoom);
-  const left=c.x-mapWidth/2,top=c.y-mapHeight/2;
+  const left=c.x-mapWidth/2,top=c.y-mapCenterY();
   const minX=Math.floor(left/TILE_SIZE),minY=Math.floor(top/TILE_SIZE);
   const maxX=Math.ceil((left+mapWidth)/TILE_SIZE),maxY=Math.ceil((top+mapHeight)/TILE_SIZE);
   for(let x=minX;x<maxX;x++)for(let y=minY;y<maxY;y++) {
@@ -271,6 +338,13 @@ function draw() {
     const a=mapPoint(boat.lat,boat.lon),b=mapPoint(pin.lat,pin.lon);
     ctx.save();ctx.lineWidth=5;ctx.strokeStyle='#ffffff';ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
     ctx.lineWidth=2.5;ctx.strokeStyle='#176981';ctx.setLineDash([8,6]);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();ctx.restore();
+    if(mode==='course'){
+      const centre=mapPoint(mid.lat,mid.lon);
+      ctx.save();ctx.fillStyle='#107b87';ctx.strokeStyle='#fff';ctx.lineWidth=3;
+      ctx.beginPath();ctx.arc(centre.x,centre.y,17,0,Math.PI*2);ctx.fill();ctx.stroke();
+      ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(centre.x-8,centre.y);ctx.lineTo(centre.x+8,centre.y);
+      ctx.moveTo(centre.x,centre.y-8);ctx.lineTo(centre.x,centre.y+8);ctx.stroke();ctx.restore();
+    }
   }
   if(mid){
     const end=destination(mid,getCourse().layout.windFrom,getCourse().layout.legLength);
@@ -335,10 +409,30 @@ function handleTap(p) {
   if(mode==='add'){addMark(geo.lat,geo.lon);return;}
   if(mode==='move'){
     const mark=getMark();if(!mark)return;
-    mark.lat=geo.lat;mark.lon=geo.lon;mark.laid=null;mode='browse';save();updateUI();toast(`${mark.name} moved`);return;
+    mark.lat=geo.lat;mark.lon=geo.lon;mark.laid=null;if(mark.generatedRole)getCourse().layout.autoAlignMarks=false;mode='browse';save();updateUI();toast(`${mark.name} moved`);return;
   }
   const nearest=pointNear(p); 
   if(nearest)pickMark(nearest.id);
+}
+function nearStartLine(p){
+  const {boat,pin}=linePoints();if(!boat||!pin)return false;
+  const a=mapPoint(boat.lat,boat.lon),b=mapPoint(pin.lat,pin.lon);
+  const x=b.x-a.x,y=b.y-a.y,length=x*x+y*y;
+  if(length<1)return Math.hypot(p.x-a.x,p.y-a.y)<30;
+  const t=Math.max(0,Math.min(1,((p.x-a.x)*x+(p.y-a.y)*y)/length));
+  return Math.hypot(p.x-(a.x+t*x),p.y-(a.y+t*y))<25;
+}
+function shiftCourseGroup(dragState,current){
+  const start=worldPoint(dragState.startGeo.lat,dragState.startGeo.lon,view.zoom);
+  const here=worldPoint(geoAt(current.x,current.y).lat,geoAt(current.x,current.y).lon,view.zoom);
+  const dx=here.x-start.x,dy=here.y-start.y;
+  for(const original of dragState.originalPoints){
+    const mark=getCourse().marks.find(m=>m.id===original.id);if(!mark)continue;
+    const world=worldPoint(original.lat,original.lon,view.zoom);
+    const moved=geoPoint(world.x+dx,world.y+dy,view.zoom);
+    mark.lat=moved.lat;mark.lon=moved.lon;
+  }
+  requestRender();
 }
 function pointNear(p){
   let nearest=null,dist=30;
@@ -348,7 +442,13 @@ function pointNear(p){
 canvas.addEventListener('pointerdown',e=>{
   e.preventDefault();canvas.setPointerCapture(e.pointerId);
   const p=pointEvent(e);pointers.set(e.pointerId,p);
-  if(pointers.size===1){const candidate=mode==='browse'?pointNear(p):null;drag={...p,startX:p.x,startY:p.y,moved:false,markId:candidate?.id||null};suppressTap=false;}
+  if(pointers.size===1){
+    const candidate=['browse','course'].includes(mode)?pointNear(p):null;
+    const groupDrag=mode==='course'&&((candidate&&['boat','pin'].includes(candidate.type))||nearStartLine(p));
+    const originalPoints=groupDrag?getCourse().marks.filter(m=>m.type==='boat'||m.type==='pin'||m.generatedRole).map(m=>({id:m.id,lat:m.lat,lon:m.lon})):null;
+    drag={...p,startX:p.x,startY:p.y,moved:false,markId:groupDrag?null:candidate?.id||null,groupDrag,startGeo:geoAt(p.x,p.y),originalPoints};
+    suppressTap=false;
+  }
   else if(pointers.size===2){pinchDistance=pointerGap();drag=null;suppressTap=true;}
 });
 canvas.addEventListener('pointermove',e=>{
@@ -357,7 +457,8 @@ canvas.addEventListener('pointermove',e=>{
   if(pointers.size===1 && drag){
     if(Math.hypot(current.x-drag.startX,current.y-drag.startY)>6)drag.moved=true;
     if(drag.moved) {
-      if(drag.markId){const mark=getCourse().marks.find(m=>m.id===drag.markId);if(mark){const geo=geoAt(current.x,current.y);mark.lat=geo.lat;mark.lon=geo.lon;requestRender();}}
+      if(drag.groupDrag)shiftCourseGroup(drag,current);
+      else if(drag.markId){const mark=getCourse().marks.find(m=>m.id===drag.markId);if(mark){const geo=geoAt(current.x,current.y);mark.lat=geo.lat;mark.lon=geo.lon;requestRender();}}
       else panBy(current.x-old.x,current.y-old.y);
     }
   } else if(pointers.size===2){
@@ -375,8 +476,18 @@ function endPointer(e){
   const p=pointers.get(e.pointerId);if(!p)return;
   const isTap=pointers.size===1&&drag&&!drag.moved&&!suppressTap;
   const draggedMark=pointers.size===1&&drag?.moved&&drag.markId?getCourse().marks.find(m=>m.id===drag.markId):null;
+  const draggedGroup=pointers.size===1&&drag?.moved&&drag.groupDrag;
   pointers.delete(e.pointerId);
-  if(draggedMark){draggedMark.laid=null;selectedId=draggedMark.id;save();updateUI();toast(`${draggedMark.name} moved`);}
+  if(draggedGroup){
+    getCourse().marks.filter(m=>m.type==='boat'||m.type==='pin'||m.generatedRole).forEach(m=>m.laid=null);
+    save();updateUI();toast('Start line and linked marks moved');
+  }
+  if(draggedMark){
+    draggedMark.laid=null;
+    if(draggedMark.generatedRole&&getCourse().layout.autoAlignMarks){getCourse().layout.autoAlignMarks=false;toast('Auto-update paused to preserve manual mark position');}
+    else toast(`${draggedMark.name} moved`);
+    selectedId=draggedMark.id;save();updateUI();
+  }
   if(pointers.size<=1){drag=null;pinchDistance=null;suppressTap=true;}
   if(isTap)handleTap(p);
 }
@@ -394,7 +505,7 @@ function fitAll() {
   const maxLon=Math.max(...positions.map(p=>p.lon)),minLon=Math.min(...positions.map(p=>p.lon));
   for(let z=MAX_ZOOM;z>=MIN_ZOOM;z--){
     const nw=worldPoint(maxLat,minLon,z),se=worldPoint(minLat,maxLon,z);
-    if(se.x-nw.x<Math.max(80,mapWidth-120)&&se.y-nw.y<Math.max(80,mapHeight-120)){
+    if(se.x-nw.x<Math.max(80,mapWidth-120)&&se.y-nw.y<Math.max(70,visibleMapHeight()-140)){
       view.zoom=z;const mid=geoPoint((nw.x+se.x)/2,(nw.y+se.y)/2,z);setCenter(mid.lat,mid.lon);return;
     }
   }
@@ -470,6 +581,8 @@ function updateLayoutControls(){
   $('windDirection').value=layout.windFrom;
   $('windSlider').value=layout.windFrom;
   $('windVisible').checked=layout.windVisible;
+  $('autoAlignMarks').checked=layout.autoAlignMarks;
+  $('squareToWind').checked=layout.squareToWind;
   $('lineLength').value=layout.lineLength;
   $('legLength').value=layout.legLength;
   $('leewardOffset').value=layout.leewardOffset;
@@ -483,17 +596,48 @@ function updateLayoutControls(){
   $('startLineSummary').textContent=current;
   drawWindOverlay();scheduleWindAnimation();
 }
+function syncGeneratedMarks(){
+  const mid=startMidpoint();if(!mid)return;
+  const l=getCourse().layout;
+  for(const m of getCourse().marks){
+    let target=null;
+    if(m.generatedRole==='windward')target=destination(mid,l.windFrom,l.legLength);
+    if(m.generatedRole==='leeward')target=destination(mid,(l.windFrom+180)%360,l.leewardOffset);
+    if(target){m.lat=target.lat;m.lon=target.lon;}
+  }
+}
+function squareLineAroundMiddle(){
+  const mid=startMidpoint();if(!mid)return false;
+  const {boat,pin}=linePoints();const l=getCourse().layout;
+  const original=trueBearing(boat,pin);
+  const choices=[(l.windFrom+90)%360,(l.windFrom+270)%360];
+  const along=choices.sort((a,b)=>Math.abs(((a-original+540)%360)-180)-Math.abs(((b-original+540)%360)-180))[0];
+  const newBoat=destination(mid,(along+180)%360,l.lineLength/2);
+  const newPin=destination(mid,along,l.lineLength/2);
+  Object.assign(boat,newBoat);Object.assign(pin,newPin);
+  return true;
+}
+function updateLinkedGeometry({square=false}={}){
+  if(square&&getCourse().layout.squareToWind)squareLineAroundMiddle();
+  if(getCourse().layout.autoAlignMarks)syncGeneratedMarks();
+}
+function toggleCourseDrag(){
+  mode=mode==='course'?'browse':'course';
+  if(mode==='course'&&!startMidpoint()){mode='browse';toast('Place both start boat and pin to move the whole start line.');}
+  updateUI();
+  if(mode==='course'&&window.innerWidth<=760)setSheetState('peek');
+}
 function setWindDirection(value){
   const n=Number(value);if(!Number.isFinite(n))return;
   getCourse().layout.windFrom=((Math.round(n)%360)+360)%360;
-  save();updateLayoutControls();requestRender();
+  updateLinkedGeometry({square:true});save();updateUI();
 }
 function syncLayoutNumbers(){
   const l=getCourse().layout;
   l.lineLength=validLength($('lineLength').value,10,2000,l.lineLength);
   l.legLength=validLength($('legLength').value,10,10000,l.legLength);
   l.leewardOffset=validLength($('leewardOffset').value,0,2000,l.leewardOffset);
-  save();updateLayoutControls();requestRender();
+  updateLinkedGeometry({square:true});save();updateUI();
 }
 function drawWindOverlay(){
   windCtx.clearRect(0,0,mapWidth,mapHeight);
@@ -539,6 +683,7 @@ function alignPinToWind(){
   })[0];
   const next=destination(boat,best,getCourse().layout.lineLength);
   pin.lat=next.lat;pin.lon=next.lon;pin.laid=null;
+  if(getCourse().layout.autoAlignMarks)syncGeneratedMarks();
   selectedId=pin.id;save();updateUI();fitAll();toast('Pin aligned perpendicular to the wind');
 }
 function generateWL(){
@@ -563,6 +708,21 @@ document.querySelectorAll('[data-wind]').forEach(btn=>btn.addEventListener('clic
 $('windVisible').addEventListener('change',e=>{getCourse().layout.windVisible=e.target.checked;save();updateLayoutControls();});
 for(const id of ['lineLength','legLength','leewardOffset']) $(id).addEventListener('change',syncLayoutNumbers);
 $('alignPin').addEventListener('click',alignPinToWind);
+$('squareLine').addEventListener('click',()=>{
+  syncLayoutNumbers();if(!squareLineAroundMiddle()){toast('Place a start boat and pin first.');return;}
+  if(getCourse().layout.autoAlignMarks)syncGeneratedMarks();
+  save();updateUI();fitAll();toast('Start line squared to wind around its centre');
+});
+$('autoAlignMarks').addEventListener('change',e=>{
+  getCourse().layout.autoAlignMarks=e.target.checked;
+  if(e.target.checked)syncGeneratedMarks();save();updateUI();
+});
+$('squareToWind').addEventListener('change',e=>{
+  getCourse().layout.squareToWind=e.target.checked;
+  if(e.target.checked)updateLinkedGeometry({square:true});save();updateUI();
+});
+$('planModeToggle').addEventListener('click',toggleCourseDrag);
+$('courseDragButton').addEventListener('click',toggleCourseDrag);
 $('generateCourse').addEventListener('click',generateWL);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden){windLast=0;scheduleWindAnimation();}});
 
@@ -582,7 +742,7 @@ $('renameCourse').addEventListener('click',()=>{
   c.name=safeName(name);save();updateCourseSelect();toast('Course renamed');
 });
 $('addButton').addEventListener('click',()=>{mode=mode==='add'?'browse':'add';updateUI();});
-$('moveButton').addEventListener('click',()=>{if(!getMark())return;mode=mode==='move'?'browse':'move';updateUI();});
+$('moveButton').addEventListener('click',()=>{if(!getMark())return;mode=mode==='move'?'browse':'move';updateUI();if(mode==='move'&&window.innerWidth<=760)setSheetState('peek');});
 $('addType').addEventListener('change',()=>{if(mode==='add')updateUI();});
 $('saveMark').addEventListener('click',()=>{
   const mark=getMark();if(!mark)return;
@@ -605,7 +765,7 @@ $('atGpsButton').addEventListener('click',()=>{
   const mark=getMark();if(!mark)return;
   if(!gpsPoint){toast('Start GPS and wait for a fix first.');return;}
   if(gpsPoint.accuracy>25&&!confirm(`GPS accuracy is ±${Math.round(gpsPoint.accuracy)} m. Move this point anyway?`))return;
-  mark.lat=gpsPoint.lat;mark.lon=gpsPoint.lon;mark.laid=null;save();updateUI();toast(`${mark.name} moved to GPS position`);
+  mark.lat=gpsPoint.lat;mark.lon=gpsPoint.lon;mark.laid=null;if(mark.generatedRole)getCourse().layout.autoAlignMarks=false;save();updateUI();toast(`${mark.name} moved to GPS position`);
 });
 $('laidButton').addEventListener('click',()=>{
   const mark=getMark();if(!mark)return;
@@ -629,10 +789,10 @@ $('restoreJson').addEventListener('click',()=>$('importFile').click());
 $('importFile').addEventListener('change',e=>{importJSON(e.target.files?.[0]);e.target.value='';});
 window.addEventListener('offline',()=>{toast('Offline: previously opened map tiles may be missing. GPS may still work.');requestRender();});
 window.addEventListener('online',()=>{tileCache.clear();requestRender();});
-window.addEventListener('resize',resize);
+window.addEventListener('resize',()=>{setSheetState(sheetState);resize();});
 if(window.ResizeObserver)new ResizeObserver(resize).observe(canvas);
 if('serviceWorker' in navigator && window.isSecureContext)navigator.serviceWorker.register('./sw.js').catch(()=>{});
 
 // Initialise. If the device has a saved course, show the marks instead of the default harbour view.
-updateCourseSelect();updateUI();resize();
+setSheetState('peek');updateCourseSelect();updateUI();resize();
 if(getCourse().marks.length)fitAll();
