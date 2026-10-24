@@ -11,8 +11,13 @@ const $ = id => document.getElementById(id);
 const canvas = $('map');
 const ctx = canvas.getContext('2d');
 const uid = () => (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-const freshCourse = name => ({id:uid(), name, marks:[]});
-const baseState = () => {const course = freshCourse('My sailing course'); return {version:1, courses:[course], activeCourseId:course.id};};
+const POINT_TYPES=['buoy','pin','boat'];
+const normalizeType=type=>POINT_TYPES.includes(type)?type:'buoy';
+const defaultLayout=()=>({windFrom:45,windVisible:true,lineLength:80,legLength:350,leewardOffset:50});
+const normalizeLayout=x=>({windFrom:Number.isFinite(Number(x?.windFrom))?((Math.round(Number(x.windFrom))%360)+360)%360:45,windVisible:x?.windVisible!==false,lineLength:validLength(x?.lineLength,10,2000,80),legLength:validLength(x?.legLength,10,10000,350),leewardOffset:validLength(x?.leewardOffset,0,2000,50)});
+function validLength(value,min,max,fallback){const n=Number(value);return Number.isFinite(n)&&n>=min&&n<=max?n:fallback;}
+const freshCourse = name => ({id:uid(), name, marks:[],layout:defaultLayout()});
+const baseState = () => {const course = freshCourse('My sailing course'); return {version:2,courses:[course], activeCourseId:course.id};};
 
 function loadState() {
   try {
@@ -21,13 +26,13 @@ function loadState() {
     const data = JSON.parse(raw);
     if(!data || !Array.isArray(data.courses) || !data.courses.length) return baseState();
     const courses = data.courses.filter(c => c && typeof c.id === 'string' && typeof c.name === 'string' && Array.isArray(c.marks)).slice(0,50).map(c => ({
-      id:c.id, name:c.name.slice(0,80), marks:c.marks.filter(m => m && typeof m.id === 'string' && Number.isFinite(m.lat) && Number.isFinite(m.lon) && Math.abs(m.lat)<=90 && Math.abs(m.lon)<=180).slice(0,250).map(m => ({
-        id:m.id, name:String(m.name || 'Mark').slice(0,60), lat:m.lat, lon:m.lon,
+      id:c.id, name:c.name.slice(0,80),layout:normalizeLayout(c.layout), marks:c.marks.filter(m => m && typeof m.id === 'string' && Number.isFinite(m.lat) && Number.isFinite(m.lon) && Math.abs(m.lat)<=90 && Math.abs(m.lon)<=180).slice(0,250).map(m => ({
+        id:m.id, name:String(m.name || 'Mark').slice(0,60), lat:m.lat, lon:m.lon, type:normalizeType(m.type),generatedRole:['windward','leeward'].includes(m.generatedRole)?m.generatedRole:null,
         laid:m.laid && Number.isFinite(m.laid.lat) && Number.isFinite(m.laid.lon) ? m.laid : null
       }))
     }));
     if(!courses.length) return baseState();
-    return {version:1,courses,activeCourseId:courses.some(c=>c.id===data.activeCourseId)?data.activeCourseId:courses[0].id};
+    return {version:2,courses,activeCourseId:courses.some(c=>c.id===data.activeCourseId)?data.activeCourseId:courses[0].id};
   } catch(e) { return baseState(); }
 }
 let state = loadState();
@@ -49,6 +54,11 @@ const pointers = new Map();
 let drag = null;
 let pinchDistance = null;
 let suppressTap = false;
+const windCanvas=$('windLayer');
+const windCtx=windCanvas.getContext('2d');
+let windLast=0;
+let windTick=0;
+let windAnimationId=0;
 
 function save() {
   try { localStorage.setItem(STORAGE_KEY,JSON.stringify(state)); }
@@ -76,6 +86,22 @@ function formatDist(m) {return m<2000?`${Math.round(m)} m`:`${(m/1852).toFixed(2
 function splitDist(m) {if(m<2000)return [String(Math.round(m)),'m']; return [(m/1852).toFixed(2),'NM'];}
 function prettyCoord(n) {return n.toFixed(6);}
 function isValidCoord(lat,lon) {return Number.isFinite(lat)&&Number.isFinite(lon)&&lat>=-85&&lat<=85&&lon>=-180&&lon<=180;}
+function compass(deg) {return ['N','NE','E','SE','S','SW','W','NW'][Math.round(((deg%360)+360)%360/45)%8];}
+function paddedBearing(deg) {return String(Math.round(deg)%360).padStart(3,'0')+'°';}
+// Geodesic forward projection: from a known point, bearing clockwise from true north, and distance in metres.
+function destination(point,bearing,metres) {
+  const r=6371008.8, a=metres/r, b=toRad(bearing),lat1=toRad(point.lat),lon1=toRad(point.lon);
+  const lat2=Math.asin(Math.sin(lat1)*Math.cos(a)+Math.cos(lat1)*Math.sin(a)*Math.cos(b));
+  const lon2=lon1+Math.atan2(Math.sin(b)*Math.sin(a)*Math.cos(lat1),Math.cos(a)-Math.sin(lat1)*Math.sin(lat2));
+  return {lat:toDeg(lat2),lon:((toDeg(lon2)+540)%360)-180};
+}
+function linePoints(){const marks=getCourse().marks;return {boat:marks.find(m=>m.type==='boat'),pin:marks.find(m=>m.type==='pin')};}
+function startMidpoint(){
+  const {boat,pin}=linePoints();if(!boat||!pin)return null;
+  return destination(boat,trueBearing(boat,pin),distanceMeters(boat,pin)/2);
+}
+function maxPointsReached(count){if(getCourse().marks.length+count>250){toast('Maximum 250 course points reached.');return true;}return false;}
+
 
 function updateCourseSelect() {
   const sel=$('courseSelect');sel.innerHTML='';
@@ -88,24 +114,26 @@ function pickMark(id) {
 function updateUI() {
   const course=getCourse(), selected=getMark();
   $('markCount').textContent=course.marks.length;
+  updateLayoutControls();
   $('emptyState').hidden=course.marks.length>0;
   $('editSection').hidden=!selected;
   $('targetName').textContent=selected?selected.name:'Choose a mark';
   $('targetStatus').textContent=selected?(selected.laid?'Buoy laid':'Target ready'):'No mark selected';
   const isAdding=mode==='add',isMoving=mode==='move';
   $('addButton').classList.toggle('active',isAdding);
-  $('addButton').innerHTML=isAdding?'× Cancel adding':'<span class="plus-icon">+</span> Add mark';
+  $('addButton').innerHTML=isAdding?'× Cancel':'<span class="plus-icon">+</span> Add point';
   $('moveButton').hidden=!selected;
   $('moveButton').textContent=isMoving?'× Cancel moving':'Move selected';
   $('mapInstruction').hidden=!(isAdding||isMoving);
-  if(isAdding)$('mapInstruction').textContent='Tap the map where you want to set the next mark.';
+  if(isAdding)$('mapInstruction').textContent=`Tap the map to place ${typeLabel($('addType').value).toLowerCase()}.`;
   if(isMoving)$('mapInstruction').textContent=`Tap a new map position for ${selected?.name||'this mark'}.`;
   if(selected) {
     $('markName').value=selected.name;
+    $('markType').value=selected.type||'buoy';
     $('markLat').value=prettyCoord(selected.lat);
     $('markLon').value=prettyCoord(selected.lon);
-    $('laidButton').textContent=selected.laid?'Clear laid record':'Record buoy laid here';
-    $('laidDetail').textContent=selected.laid ? `Laid at ${prettyCoord(selected.laid.lat)}, ${prettyCoord(selected.laid.lon)}. Offset: ${formatDist(distanceMeters(selected, selected.laid))}.` : 'When you lay the buoy, record your current GPS position to compare it with the planned mark.';
+    $('laidButton').textContent=selected.laid?'Clear position record':selected.type==='boat'?'Record boat here':'Record mark laid here';
+    $('laidDetail').textContent=selected.laid ? `Recorded at ${prettyCoord(selected.laid.lat)}, ${prettyCoord(selected.laid.lon)}. Offset: ${formatDist(distanceMeters(selected, selected.laid))}.` : selected.type==='boat'?'Record the boat’s actual GPS position once anchored, if useful.':'When you lay the mark, record its actual GPS position to compare with the plan.';
   }
   renderList(); updateNavigation(); updateGpsStatus(); requestRender();
 }
@@ -114,11 +142,12 @@ function renderList() {
   getCourse().marks.forEach((mark,i)=>{
     const button=document.createElement('button');
     button.type='button';button.className=`mark-row${selectedId===mark.id?' selected':''}${mark.laid?' laid':''}`;
-    const n=document.createElement('span');n.className='mark-number';n.textContent=i+1;
+    const n=document.createElement('span');n.className='mark-number '+(mark.type||'buoy');n.textContent=mark.type==='boat'?'⛵':mark.type==='pin'?'P':String(i+1);
     const info=document.createElement('span');info.className='mark-info';
     const title=document.createElement('span');title.className='mark-title';title.textContent=mark.name;
     const sub=document.createElement('span');sub.className='mark-sub';sub.textContent=`${prettyCoord(mark.lat)}, ${prettyCoord(mark.lon)}`;
-    info.append(title,sub);
+    const kind=document.createElement('span');kind.className='mark-kind';kind.textContent=typeLabel(mark.type)+' · ';
+    sub.prepend(kind);info.append(title,sub);
     const right=document.createElement('span');right.className='mark-right';
     if(gpsPoint){const dist=document.createElement('span');dist.className='mark-dist';dist.textContent=formatDist(distanceMeters(gpsPoint,mark));right.appendChild(dist);}
     if(mark.laid){const done=document.createElement('span');done.className='mark-laid';done.textContent='LAID ✓';right.appendChild(done);}
@@ -147,12 +176,15 @@ function updateGpsStatus() {
   $('gpsButton').classList.toggle('active',gpsWatch!==null);
   $('centreButton').classList.toggle('active',followGPS);
 }
+function typeLabel(t){return ({buoy:'Orange mark',pin:'Pin end',boat:'Start boat'})[normalizeType(t)];}
 function addMark(lat,lon) {
   const course=getCourse();
+  const type=normalizeType($('addType').value);
+  if((type==='pin'||type==='boat')&&course.marks.some(m=>m.type===type)){toast(`There is already a ${typeLabel(type).toLowerCase()}. Select it to move it.`);return;}
   if(course.marks.length>=250){toast('This course has reached 250 marks.');return;}
   const numbers=course.marks.map(m=>Number((m.name.match(/^Mark (\d+)$/)||[])[1])).filter(Boolean);
   let n=1;while(numbers.includes(n))n++;
-  const mark={id:uid(),name:`Mark ${n}`,lat,lon,laid:null};
+  const mark={id:uid(),name:type==='boat'?'Start boat':type==='pin'?'Pin end':`Mark ${n}`,lat,lon,laid:null,type,generatedRole:null};
   course.marks.push(mark);selectedId=mark.id;mode='browse';save();updateUI();toast(`${mark.name} added`);
 }
 
@@ -197,7 +229,8 @@ function resize() {
   const dpr=Math.min(3,window.devicePixelRatio||1);
   canvas.width=Math.round(mapWidth*dpr);canvas.height=Math.round(mapHeight*dpr);
   ctx.setTransform(dpr,0,0,dpr,0,0);
-  requestRender();
+  windCanvas.width=Math.round(mapWidth*dpr);windCanvas.height=Math.round(mapHeight*dpr);windCtx.setTransform(dpr,0,0,dpr,0,0);
+  requestRender();drawWindOverlay();
 }
 function requestRender() {
   if(renderPending)return;
@@ -232,6 +265,19 @@ function draw() {
     if(tile&&tile.ready)ctx.drawImage(tile.img,sx,sy,TILE_SIZE+0.5,TILE_SIZE+0.5);
     else {ctx.strokeStyle='#cbdee0';ctx.lineWidth=.7;ctx.strokeRect(sx,sy,TILE_SIZE,TILE_SIZE);}
   }
+  // Start line and windward guide stay visible even when flowing wind particles are off.
+  const {boat,pin}=linePoints();const mid=startMidpoint();
+  if(boat&&pin){
+    const a=mapPoint(boat.lat,boat.lon),b=mapPoint(pin.lat,pin.lon);
+    ctx.save();ctx.lineWidth=5;ctx.strokeStyle='#ffffff';ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
+    ctx.lineWidth=2.5;ctx.strokeStyle='#176981';ctx.setLineDash([8,6]);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();ctx.restore();
+  }
+  if(mid){
+    const end=destination(mid,getCourse().layout.windFrom,getCourse().layout.legLength);
+    const a=mapPoint(mid.lat,mid.lon),b=mapPoint(end.lat,end.lon);
+    ctx.save();ctx.strokeStyle='rgba(19,128,149,.64)';ctx.setLineDash([7,9]);ctx.lineWidth=1.7;
+    ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();ctx.restore();
+  }
   const selected=getMark();
   if(selected&&gpsPoint) {
     const a=mapPoint(gpsPoint.lat,gpsPoint.lon),b=mapPoint(selected.lat,selected.lon);
@@ -244,10 +290,18 @@ function draw() {
     const selectedMark=selectedId===mark.id;
     ctx.save();ctx.translate(x,y);
     if(selectedMark){ctx.fillStyle='rgba(6,117,125,.16)';ctx.beginPath();ctx.arc(0,-9,26,0,2*Math.PI);ctx.fill();}
-    ctx.fillStyle=mark.laid?'#22866a':'#e58c35';ctx.strokeStyle='#fff';ctx.lineWidth=3;
-    ctx.beginPath();ctx.moveTo(0,9);ctx.lineTo(-11,-5);ctx.arc(0,-10,13,Math.PI*.78,Math.PI*2.22);ctx.lineTo(11,-5);ctx.closePath();ctx.fill();ctx.stroke();
-    ctx.fillStyle='#fff';ctx.textAlign='center';ctx.textBaseline='middle';ctx.font='bold 13px system-ui,sans-serif';
-    ctx.fillText(String(i+1),0,-11);
+    ctx.strokeStyle='#fff';ctx.lineWidth=3;ctx.lineJoin='round';
+    if(mark.type==='boat') {
+      ctx.fillStyle=mark.laid?'#22866a':'#143e54';
+      ctx.beginPath();ctx.moveTo(-15,-11);ctx.lineTo(15,-11);ctx.lineTo(10,-1);ctx.lineTo(-10,-1);ctx.closePath();ctx.fill();ctx.stroke();
+      ctx.beginPath();ctx.moveTo(0,-13);ctx.lineTo(0,-28);ctx.moveTo(-9,-13);ctx.lineTo(10,-13);ctx.stroke();
+      ctx.strokeStyle='#143e54';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(0,-28);ctx.lineTo(-7,-21);ctx.lineTo(0,-21);ctx.stroke();
+    } else {
+      ctx.fillStyle=mark.laid?'#22866a':'#e58c35';
+      ctx.beginPath();ctx.moveTo(0,9);ctx.lineTo(-11,-5);ctx.arc(0,-10,13,Math.PI*.78,Math.PI*2.22);ctx.lineTo(11,-5);ctx.closePath();ctx.fill();ctx.stroke();
+      ctx.fillStyle='#fff';ctx.textAlign='center';ctx.textBaseline='middle';ctx.font='bold 13px system-ui,sans-serif';
+      ctx.fillText(mark.type==='pin'?'P':String(i+1),0,-11);
+    }
     const label=mark.name.slice(0,24);ctx.font=`${selectedMark?'bold ':''}12px system-ui,sans-serif`;
     const width=ctx.measureText(label).width+14;
     roundRect(ctx,-width/2,14,width,24,6);ctx.fillStyle=selectedMark?'#102b39':'#fff';ctx.fill();
@@ -283,14 +337,18 @@ function handleTap(p) {
     const mark=getMark();if(!mark)return;
     mark.lat=geo.lat;mark.lon=geo.lon;mark.laid=null;mode='browse';save();updateUI();toast(`${mark.name} moved`);return;
   }
-  let nearest=null,dist=28;
-  for(const m of getCourse().marks){const pt=mapPoint(m.lat,m.lon);const d=Math.hypot(pt.x-p.x,pt.y-9-p.y);if(d<dist){nearest=m;dist=d;}}
+  const nearest=pointNear(p); 
   if(nearest)pickMark(nearest.id);
+}
+function pointNear(p){
+  let nearest=null,dist=30;
+  for(const m of getCourse().marks){const pt=mapPoint(m.lat,m.lon);const d=Math.hypot(pt.x-p.x,pt.y-12-p.y);if(d<dist){nearest=m;dist=d;}}
+  return nearest;
 }
 canvas.addEventListener('pointerdown',e=>{
   e.preventDefault();canvas.setPointerCapture(e.pointerId);
   const p=pointEvent(e);pointers.set(e.pointerId,p);
-  if(pointers.size===1){drag={...p,startX:p.x,startY:p.y,moved:false};suppressTap=false;}
+  if(pointers.size===1){const candidate=mode==='browse'?pointNear(p):null;drag={...p,startX:p.x,startY:p.y,moved:false,markId:candidate?.id||null};suppressTap=false;}
   else if(pointers.size===2){pinchDistance=pointerGap();drag=null;suppressTap=true;}
 });
 canvas.addEventListener('pointermove',e=>{
@@ -298,7 +356,10 @@ canvas.addEventListener('pointermove',e=>{
   const old=pointers.get(e.pointerId);const current=pointEvent(e);
   if(pointers.size===1 && drag){
     if(Math.hypot(current.x-drag.startX,current.y-drag.startY)>6)drag.moved=true;
-    if(drag.moved)panBy(current.x-old.x,current.y-old.y);
+    if(drag.moved) {
+      if(drag.markId){const mark=getCourse().marks.find(m=>m.id===drag.markId);if(mark){const geo=geoAt(current.x,current.y);mark.lat=geo.lat;mark.lon=geo.lon;requestRender();}}
+      else panBy(current.x-old.x,current.y-old.y);
+    }
   } else if(pointers.size===2){
     const before=pointerMid();pointers.set(e.pointerId,current);
     const after=pointerMid();panBy(after.x-before.x,after.y-before.y);
@@ -313,7 +374,9 @@ canvas.addEventListener('pointermove',e=>{
 function endPointer(e){
   const p=pointers.get(e.pointerId);if(!p)return;
   const isTap=pointers.size===1&&drag&&!drag.moved&&!suppressTap;
+  const draggedMark=pointers.size===1&&drag?.moved&&drag.markId?getCourse().marks.find(m=>m.id===drag.markId):null;
   pointers.delete(e.pointerId);
+  if(draggedMark){draggedMark.laid=null;selectedId=draggedMark.id;save();updateUI();toast(`${draggedMark.name} moved`);}
   if(pointers.size<=1){drag=null;pinchDistance=null;suppressTap=true;}
   if(isTap)handleTap(p);
 }
@@ -370,10 +433,10 @@ function fileSafeName(text){return (text||'course').toLowerCase().replace(/[^a-z
 function xmlEsc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&apos;'}[c]));}
 function exportGPX(){
   const c=getCourse();
-  if(!c.marks.length){toast('Add a mark before exporting GPX.');return;}
+  if(!c.marks.length){toast('Add a point before exporting GPX.');return;}
   let gpx=`<?xml version="1.0" encoding="utf-8"?>\n<gpx version="1.1" creator="BuoyPlot" xmlns="http://www.topografix.com/GPX/1/1">\n  <metadata><name>${xmlEsc(c.name)}</name></metadata>\n`;
   for(const m of c.marks){
-    gpx+=`  <wpt lat="${m.lat.toFixed(8)}" lon="${m.lon.toFixed(8)}"><name>${xmlEsc(m.name)}</name><sym>Buoy</sym></wpt>\n`;
+    gpx+=`  <wpt lat="${m.lat.toFixed(8)}" lon="${m.lon.toFixed(8)}"><name>${xmlEsc(m.name)}</name><sym>${m.type==='boat'?'Boat Ramp':'Buoy'}</sym><type>${xmlEsc(normalizeType(m.type))}</type></wpt>\n`;
   }
   gpx+='</gpx>\n';downloadText(`${fileSafeName(c.name)}.gpx`,gpx,'application/gpx+xml');toast('GPX waypoints exported');
 }
@@ -387,10 +450,10 @@ function importJSON(file){
   reader.onload=()=>{
     try{
       const parsed=JSON.parse(String(reader.result));
-      if(parsed.version!==1||!Array.isArray(parsed.courses)||!parsed.courses.length)throw new Error('Invalid BuoyPlot backup');
+      if(![1,2].includes(parsed.version)||!Array.isArray(parsed.courses)||!parsed.courses.length)throw new Error('Invalid BuoyPlot backup');
       const normalized=parsed.courses.filter(c=>c&&Array.isArray(c.marks)&&typeof c.name==='string').map(c=>({
-        id:uid(),name:c.name.slice(0,80),marks:c.marks.filter(m=>m&&isValidCoord(Number(m.lat),Number(m.lon))).slice(0,250).map(m=>({
-          id:uid(),name:safeName(m.name)||'Mark',lat:Number(m.lat),lon:Number(m.lon),laid:m.laid&&isValidCoord(Number(m.laid.lat),Number(m.laid.lon))?{lat:Number(m.laid.lat),lon:Number(m.laid.lon),accuracy:Number(m.laid.accuracy)||0,time:String(m.laid.time||'')}:null
+        id:uid(),name:c.name.slice(0,80),layout:normalizeLayout(c.layout),marks:c.marks.filter(m=>m&&isValidCoord(Number(m.lat),Number(m.lon))).slice(0,250).map(m=>({
+          id:uid(),name:safeName(m.name)||'Mark',lat:Number(m.lat),lon:Number(m.lon),type:normalizeType(m.type),generatedRole:['windward','leeward'].includes(m.generatedRole)?m.generatedRole:null,laid:m.laid&&isValidCoord(Number(m.laid.lat),Number(m.laid.lon))?{lat:Number(m.laid.lat),lon:Number(m.laid.lon),accuracy:Number(m.laid.accuracy)||0,time:String(m.laid.time||'')}:null
         }))
       })).slice(0,50);
       if(!normalized.length)throw new Error('No courses found');
@@ -400,6 +463,108 @@ function importJSON(file){
   };
   reader.readAsText(file);
 }
+
+// --- Wind layer and wind-aligned racecourse geometry ---
+function updateLayoutControls(){
+  const layout=getCourse().layout||(getCourse().layout=defaultLayout());
+  $('windDirection').value=layout.windFrom;
+  $('windSlider').value=layout.windFrom;
+  $('windVisible').checked=layout.windVisible;
+  $('lineLength').value=layout.lineLength;
+  $('legLength').value=layout.legLength;
+  $('leewardOffset').value=layout.leewardOffset;
+  $('windBadge').textContent=`${paddedBearing(layout.windFrom)} ${compass(layout.windFrom)}`;
+  $('windMapStatus').textContent=`WIND FROM ${paddedBearing(layout.windFrom)} ${compass(layout.windFrom)}`;
+  $('windMapStatus').hidden=!layout.windVisible;
+  document.querySelectorAll('[data-wind]').forEach(btn=>btn.classList.toggle('active',Number(btn.dataset.wind)===layout.windFrom));
+  const {boat,pin}=linePoints();
+  const current=boat&&pin?`Start line: ${formatDist(distanceMeters(boat,pin))}, bearing ${paddedBearing(trueBearing(boat,pin))}.`:
+    !boat&&!pin?'Place a start boat and pin end to define the start line.':`Add ${boat?'the pin end':'the start boat'} to finish the start line.`;
+  $('startLineSummary').textContent=current;
+  drawWindOverlay();scheduleWindAnimation();
+}
+function setWindDirection(value){
+  const n=Number(value);if(!Number.isFinite(n))return;
+  getCourse().layout.windFrom=((Math.round(n)%360)+360)%360;
+  save();updateLayoutControls();requestRender();
+}
+function syncLayoutNumbers(){
+  const l=getCourse().layout;
+  l.lineLength=validLength($('lineLength').value,10,2000,l.lineLength);
+  l.legLength=validLength($('legLength').value,10,10000,l.legLength);
+  l.leewardOffset=validLength($('leewardOffset').value,0,2000,l.leewardOffset);
+  save();updateLayoutControls();requestRender();
+}
+function drawWindOverlay(){
+  windCtx.clearRect(0,0,mapWidth,mapHeight);
+  const l=getCourse().layout;
+  if(!l.windVisible||!mapWidth||!mapHeight)return;
+  const heading=toRad((l.windFrom+180)%360); // Wind-from direction becomes a moving TO arrow.
+  const dx=Math.sin(heading),dy=-Math.cos(heading);
+  const nx=-dy,ny=dx;
+  // Screen-aligned grid rather than geographical wind speeds; direction only, not a forecast.
+  const spacing=92;
+  windCtx.save();windCtx.strokeStyle='rgba(4,110,140,.65)';windCtx.lineWidth=1.9;windCtx.lineCap='round';windCtx.lineJoin='round';
+  for(let y=-spacing;y<mapHeight+spacing;y+=spacing){
+    for(let x=-spacing;x<mapWidth+spacing;x+=spacing){
+      const phase=((windTick+((x+y)*.055))%spacing+spacing)%spacing-spacing/2;
+      const cx=x+dx*phase,cy=y+dy*phase;
+      const ax=cx-dx*12,ay=cy-dy*12,bx=cx+dx*12,by=cy+dy*12;
+      windCtx.beginPath();windCtx.moveTo(ax,ay);windCtx.lineTo(bx,by);windCtx.stroke();
+      windCtx.beginPath();windCtx.moveTo(bx,by);windCtx.lineTo(bx-dx*6+nx*4,by-dy*6+ny*4);windCtx.moveTo(bx,by);windCtx.lineTo(bx-dx*6-nx*4,by-dy*6-ny*4);windCtx.stroke();
+    }
+  }
+  windCtx.restore();
+}
+function scheduleWindAnimation(){
+  if(windAnimationId)return;
+  if(!getCourse().layout.windVisible||document.hidden||window.matchMedia('(prefers-reduced-motion: reduce)').matches)return;
+  windAnimationId=requestAnimationFrame(function tick(time){
+    if(!getCourse().layout.windVisible||document.hidden){windAnimationId=0;return;}
+    windAnimationId=requestAnimationFrame(tick);
+    if(time-windLast<70)return;
+    const elapsed=Math.min(time-windLast||70,120);windLast=time;
+    windTick=(windTick+elapsed*.028)%92;
+    drawWindOverlay();
+  });
+}
+function alignPinToWind(){
+  syncLayoutNumbers();
+  const {boat,pin}=linePoints();if(!boat||!pin){toast('Place both a start boat and pin end first.');return;}
+  const d=getCourse().layout.windFrom;
+  const port=(d+90)%360,starboard=(d+270)%360;
+  const best=[port,starboard].sort((a,b)=>{
+    const orig=trueBearing(boat,pin);
+    return Math.abs(((a-orig+540)%360)-180)-Math.abs(((b-orig+540)%360)-180);
+  })[0];
+  const next=destination(boat,best,getCourse().layout.lineLength);
+  pin.lat=next.lat;pin.lon=next.lon;pin.laid=null;
+  selectedId=pin.id;save();updateUI();fitAll();toast('Pin aligned perpendicular to the wind');
+}
+function generateWL(){
+  syncLayoutNumbers();
+  const middle=startMidpoint();if(!middle){toast('Add a start boat and pin end first.');return;}
+  const l=getCourse().layout;
+  const positions=[{role:'windward',name:'Windward',pos:destination(middle,l.windFrom,l.legLength)},
+                   {role:'leeward',name:'Leeward',pos:destination(middle,(l.windFrom+180)%360,l.leewardOffset)}];
+  const needed=positions.filter(item=>!getCourse().marks.some(m=>m.generatedRole===item.role)).length;
+  if(maxPointsReached(needed))return;
+  if(positions.some(item=>getCourse().marks.some(m=>m.generatedRole===item.role))&&!confirm('Update the existing generated windward/leeward positions? This replaces their planned coordinates.'))return;
+  for(const item of positions){
+    let mark=getCourse().marks.find(m=>m.generatedRole===item.role);
+    if(mark){mark.lat=item.pos.lat;mark.lon=item.pos.lon;mark.laid=null;mark.type='buoy';}
+    else getCourse().marks.push({id:uid(),name:item.name,lat:item.pos.lat,lon:item.pos.lon,type:'buoy',laid:null,generatedRole:item.role});
+  }
+  save();selectedId=getCourse().marks.find(m=>m.generatedRole==='windward')?.id||null;updateUI();fitAll();toast('Windward and leeward marks positioned');
+}
+$('windDirection').addEventListener('change',e=>{if(e.target.value==='')return;setWindDirection(e.target.value);});
+$('windSlider').addEventListener('input',e=>setWindDirection(e.target.value));
+document.querySelectorAll('[data-wind]').forEach(btn=>btn.addEventListener('click',()=>setWindDirection(btn.dataset.wind)));
+$('windVisible').addEventListener('change',e=>{getCourse().layout.windVisible=e.target.checked;save();updateLayoutControls();});
+for(const id of ['lineLength','legLength','leewardOffset']) $(id).addEventListener('change',syncLayoutNumbers);
+$('alignPin').addEventListener('click',alignPinToWind);
+$('generateCourse').addEventListener('click',generateWL);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden){windLast=0;scheduleWindAnimation();}});
 
 // --- Controls ---
 $('newCourse').addEventListener('click',()=>{
@@ -418,6 +583,7 @@ $('renameCourse').addEventListener('click',()=>{
 });
 $('addButton').addEventListener('click',()=>{mode=mode==='add'?'browse':'add';updateUI();});
 $('moveButton').addEventListener('click',()=>{if(!getMark())return;mode=mode==='move'?'browse':'move';updateUI();});
+$('addType').addEventListener('change',()=>{if(mode==='add')updateUI();});
 $('saveMark').addEventListener('click',()=>{
   const mark=getMark();if(!mark)return;
   const name=safeName($('markName').value),lat=Number($('markLat').value),lon=Number($('markLon').value);
@@ -425,13 +591,21 @@ $('saveMark').addEventListener('click',()=>{
   if(!$('markLat').value.trim()||!$('markLon').value.trim()||!isValidCoord(lat,lon)){
     toast('Enter valid latitude and longitude coordinates.');return;
   }
-  mark.name=name;mark.lat=lat;mark.lon=lon;save();updateUI();toast('Mark updated');
+  const nextType=normalizeType($('markType').value);
+  if(nextType!=='buoy'&&getCourse().marks.some(m=>m.id!==mark.id&&m.type===nextType)){toast(`Only one ${typeLabel(nextType).toLowerCase()} per course.`);return;}
+  mark.name=name;mark.lat=lat;mark.lon=lon;mark.type=nextType;mark.generatedRole=null;save();updateUI();toast('Point updated');
 });
 $('deleteMark').addEventListener('click',()=>{
   const mark=getMark();if(!mark)return;
   if(!confirm(`Delete ${mark.name}?`))return;
   getCourse().marks=getCourse().marks.filter(m=>m.id!==mark.id);
   selectedId=null;mode='browse';save();updateUI();toast('Mark deleted');
+});
+$('atGpsButton').addEventListener('click',()=>{
+  const mark=getMark();if(!mark)return;
+  if(!gpsPoint){toast('Start GPS and wait for a fix first.');return;}
+  if(gpsPoint.accuracy>25&&!confirm(`GPS accuracy is ±${Math.round(gpsPoint.accuracy)} m. Move this point anyway?`))return;
+  mark.lat=gpsPoint.lat;mark.lon=gpsPoint.lon;mark.laid=null;save();updateUI();toast(`${mark.name} moved to GPS position`);
 });
 $('laidButton').addEventListener('click',()=>{
   const mark=getMark();if(!mark)return;
