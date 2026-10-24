@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#102b39">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="BuoyPlot">
+  <meta name="description" content="Plan sailing marks on a map, then find them using GPS.">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="apple-touch-icon" href="./icon-192.png">
+  <link rel="icon" href="./icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./styles.css">
+  <title>BuoyPlot | Sailing mark setter</title>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"><span></span></span>
+      <div><div class="brand-name">BuoyPlot</div><div class="brand-caption">COURSE MARK SETTER</div></div>
+    </div>
+    <div class="course-controls">
+      <label class="sr-only" for="courseSelect">Current course</label>
+      <select id="courseSelect" aria-label="Current course"></select>
+      <button class="icon-button new-course" id="newCourse" title="Create a course" aria-label="Create course">+</button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <section class="map-container" aria-label="Map of sailing marks">
+      <canvas id="map" aria-label="Interactive map: drag to move and use Add mark to place a buoy"></canvas>
+      <div class="map-status">
+        <div id="gpsStatus" class="gps-status"><span class="status-dot"></span> GPS off</div>
+        <div class="north-indicator">↑ N</div>
+      </div>
+      <div class="map-tools">
+        <button id="gpsButton" class="map-icon gps-button" title="Start or stop GPS tracking" aria-label="Start GPS"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg></button>
+        <button id="centreButton" class="map-icon" title="Centre on your position" aria-label="Centre on GPS"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="1" fill="currentColor"/></svg></button>
+        <button id="zoomIn" class="map-icon" aria-label="Zoom in">+</button>
+        <button id="zoomOut" class="map-icon" aria-label="Zoom out">−</button>
+        <button id="fitButton" class="map-icon" title="Show all marks" aria-label="Fit all marks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/></svg></button>
+      </div>
+      <div id="mapInstruction" class="map-instruction" hidden></div>
+      <div class="map-bottom-controls">
+        <button class="primary-button" id="addButton"><span class="plus-icon">+</span> Add mark</button>
+        <button class="secondary-button" id="moveButton" hidden>Move selected</button>
+      </div>
+      <div class="attribution">© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> contributors</div>
+    </section>
+
+    <aside class="panel">
+      <section class="navigator" aria-label="GPS navigation to target mark">
+        <div class="navigator-head"><span class="eyebrow">ACTIVE TARGET</span><span class="nav-pill" id="targetStatus">No mark selected</span></div>
+        <h1 id="targetName">Choose a mark</h1>
+        <div class="nav-figures">
+          <div><div class="figure-label">DISTANCE</div><div id="distance" class="figure">--<span class="figure-unit"> m</span></div></div>
+          <div><div class="figure-label">BEARING (TRUE)</div><div id="bearing" class="figure">--<span class="figure-unit">°</span></div></div>
+        </div>
+        <p class="nav-subtext" id="navDetail">Select a mark, then start GPS for live guidance.</p>
+      </section>
+
+      <section class="marks-section" aria-label="Course marks">
+        <div class="section-heading">
+          <div><span class="eyebrow">YOUR COURSE</span><h2>Marks <span id="markCount" class="count">0</span></h2></div>
+          <button id="renameCourse" class="text-button" title="Rename the course">Rename course</button>
+        </div>
+        <div class="mark-list" id="markList"></div>
+        <div id="emptyState" class="empty-state"><div class="empty-buoy">◎</div><strong>No marks yet</strong><span>Tap <b>Add mark</b>, then tap the map to place a buoy.</span></div>
+      </section>
+
+      <section id="editSection" class="editor" hidden>
+        <div class="section-heading editor-header"><div><span class="eyebrow">SELECTED MARK</span><h2>Details</h2></div><button id="deleteMark" class="text-button destructive">Delete</button></div>
+        <label for="markName">Name</label><input id="markName" type="text" maxlength="60" autocomplete="off" spellcheck="false">
+        <div class="coord-grid"><div><label for="markLat">Latitude</label><input id="markLat" type="number" min="-90" max="90" step="any" inputmode="decimal"></div><div><label for="markLon">Longitude</label><input id="markLon" type="number" min="-180" max="180" step="any" inputmode="decimal"></div></div>
+        <div class="edit-actions"><button id="saveMark" class="secondary-button">Save details</button><button id="laidButton" class="outline-button">Record buoy laid here</button></div>
+        <p class="laid-detail" id="laidDetail"></p>
+      </section>
+
+      <div class="footer-actions">
+        <button id="exportGpx" class="footer-button">Export GPX</button>
+        <button id="backupJson" class="footer-button">Backup JSON</button>
+        <button id="restoreJson" class="footer-button">Import</button>
+        <input id="importFile" type="file" accept="application/json,.json" hidden>
+      </div>
+      <p class="small-note">Course data is stored on this device. Export a backup before clearing browser data. GPS and the map are aids to mark placement, not a substitute for safe navigation.</p>
+    </aside>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="./app.js" defer></script>
+</body>
+</html>
