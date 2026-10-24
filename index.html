@@ -38,6 +38,7 @@
       </div>
       <div class="map-tools">
         <button id="courseDragButton" class="map-icon course-drag-button" title="Move the start line and its linked course marks together" aria-label="Enable course drag mode" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20M2 12h20M12 2l-3 3m3-3 3 3M12 22l-3-3m3 3 3-3M2 12l3-3m-3 3 3 3M22 12l-3-3m3 3-3 3"/></svg></button>
+        <button id="mapStyleButton" class="map-icon layer-button" title="Switch between street and satellite maps" aria-label="Switch to satellite map" aria-pressed="false">SAT</button>
         <button id="gpsButton" class="map-icon gps-button" title="Start or stop GPS tracking" aria-label="Start GPS"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg></button>
         <button id="centreButton" class="map-icon" title="Centre on your position" aria-label="Centre on GPS"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="1" fill="currentColor"/></svg></button>
         <button id="zoomIn" class="map-icon" aria-label="Zoom in">+</button>
@@ -45,12 +46,13 @@
         <button id="fitButton" class="map-icon" title="Show all marks" aria-label="Fit all marks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/></svg></button>
       </div>
       <div id="mapInstruction" class="map-instruction" hidden></div>
+      <div id="lineMapReadout" class="line-map-readout" hidden></div>
       <div class="map-bottom-controls">
         <label class="sr-only" for="addType">Point type to place</label>
         <select id="addType" class="add-type" aria-label="Point type"><option value="buoy">Orange mark</option><option value="pin">Pin end</option><option value="boat">Start boat</option></select>
         <button class="primary-button" id="addButton"><span class="plus-icon">+</span> Add point</button>
       </div>
-      <div class="attribution">© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> contributors</div>
+      <div class="attribution" id="mapAttribution">© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> contributors</div>
     </section>
 
     <aside class="panel" id="controlsPanel" aria-label="Course controls">
@@ -72,7 +74,7 @@
       <section class="marks-section" aria-label="Course marks">
         <div class="section-heading">
           <div><span class="eyebrow">YOUR COURSE</span><h2>Course points <span id="markCount" class="count">0</span></h2></div>
-          <button id="renameCourse" class="text-button" title="Rename the course">Rename course</button>
+          <div class="mark-list-actions"><button id="renameCourse" class="text-button" title="Rename the course">Rename</button><button id="clearMarks" class="text-button destructive" title="Delete every point in this course">Clear all</button></div>
         </div>
         <div class="mark-list" id="markList"></div>
         <div id="emptyState" class="empty-state"><div class="empty-buoy">◎</div><strong>No marks yet</strong><span>Choose a point type, tap <b>Add point</b>, then tap the map.</span></div>
@@ -93,11 +95,14 @@
         <label class="wind-toggle"><input id="autoAlignMarks" type="checkbox" checked> Automatically update generated marks when wind or leg distances change</label>
         <label class="wind-toggle"><input id="squareToWind" type="checkbox"> Keep the start line square to wind changes</label>
         <div class="layout-divider"></div>
+        <div class="layout-grid layout-type-grid"><div><label for="courseType">Course layout</label><select id="courseType" class="layout-select"><option value="wl">Windward / leeward</option><option value="triangle">Triangle</option></select></div><div id="roundingField"><label for="rounding">Triangle rounding</label><select id="rounding" class="layout-select"><option value="port">Port (left)</option><option value="starboard">Starboard (right)</option></select></div></div>
+        <div id="triangleSettings" class="layout-grid"><div><label for="triangleWidth">Wing offset (% of leg)</label><input id="triangleWidth" type="number" min="20" max="120" step="5" value="60" inputmode="numeric"></div><div class="layout-action-hint">Wing mark is halfway downwind, offset left for port or right for starboard roundings.</div></div>
+        <div class="layout-divider"></div>
         <div id="startLineSummary" class="settings-note">Place a start boat and pin end to define your start line.</div>
         <div class="layout-grid"><div><label for="lineLength">Line length (m)</label><input id="lineLength" type="number" min="10" max="2000" step="5" value="80" inputmode="decimal"></div><div><label for="legLength">Windward leg (m)</label><input id="legLength" type="number" min="10" max="10000" step="10" value="350" inputmode="decimal"></div></div>
         <div class="layout-grid"><div><label for="leewardOffset">Leeward offset (m)</label><input id="leewardOffset" type="number" min="0" max="2000" step="5" value="50" inputmode="decimal"></div><div class="layout-action-hint">Positions are estimates.<br>Move points to fine-tune.</div></div>
         <div class="layout-buttons"><button type="button" id="alignPin" class="secondary-button">Align pin across wind</button><button type="button" id="squareLine" class="secondary-button">Square line around centre</button><button type="button" id="generateCourse" class="secondary-button">Place W/L marks</button></div>
-        <p class="settings-note layout-explainer">Align pin keeps the start boat fixed. Square line rotates the whole start line around its midpoint. Place W/L adds or updates the two generated orange marks. Manual buoy positions are not changed by these tools.</p>
+        <p class="settings-note layout-explainer">Align pin keeps the start boat fixed. Square line rotates the whole start line around its midpoint. Generate marks creates either a windward/leeward or 3-buoy triangle course from your start line. Port and starboard triangle options place the wing mark on opposite sides. Manually added buoys are left alone.</p>
       </section>
 
       <section id="editSection" class="editor" hidden>
@@ -107,6 +112,7 @@
         <div class="coord-grid"><div><label for="markLat">Latitude</label><input id="markLat" type="number" min="-90" max="90" step="any" inputmode="decimal"></div><div><label for="markLon">Longitude</label><input id="markLon" type="number" min="-180" max="180" step="any" inputmode="decimal"></div></div>
         <div class="edit-actions"><button id="moveButton" class="secondary-button">Move on map</button><button id="saveMark" class="secondary-button">Save details</button><button id="atGpsButton" class="outline-button">Set to my GPS</button><button id="laidButton" class="outline-button">Record laid here</button></div>
         <p class="laid-detail" id="laidDetail"></p>
+        <div class="drift-box" id="driftBox"><div class="drift-head"><strong>Drift check</strong><span id="driftBadge" class="drift-badge">NOT CHECKED</span></div><p id="driftDetail" class="settings-note">Record the position when laying the buoy, then return alongside it later to check.</p><div class="drift-actions"><button id="checkDrift" class="secondary-button">Check at my GPS</button><button id="clearDrift" class="text-button" hidden>Clear check</button></div></div>
       </section>
 
       <div class="footer-actions">
@@ -115,7 +121,7 @@
         <button id="restoreJson" class="footer-button">Import</button>
         <input id="importFile" type="file" accept="application/json,.json" hidden>
       </div>
-      <p class="small-note">Wind is manually entered and not a live weather forecast. Course data is stored on this device. Export a backup before clearing browser data. GPS and the map are aids to mark placement, not a substitute for safe navigation.</p>
+      <p class="small-note">Wind is manually entered and not a live weather forecast. Course data is stored on this device. Export a backup before clearing browser data. To check drift, take a fresh GPS fix while alongside the same buoy at a comparable phone position. Drift indications are estimates, not remote buoy tracking. Maps, imagery and GPS are aids only, not nautical navigation charts.</p>
       </div>
     </aside>
   </main>

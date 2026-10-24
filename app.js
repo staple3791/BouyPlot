@@ -1,8 +1,9 @@
 'use strict';
 
 // BuoyPlot: dependency-free, static sailing mark planner.
-// The chart background uses live OpenStreetMap tiles; marks and navigation do not depend on those tiles.
-const STORAGE_KEY = 'buoyplot-courses-v1';
+// Backgrounds use online map/imagery services, while mark positioning uses local WGS84 coordinates.
+const STORAGE_KEY = 'buoyplot-courses-v1'; // Preserve existing courses across app upgrades.
+const MAP_STYLE_KEY = 'buoyplot-map-style-v1';
 const TILE_SIZE = 256;
 const MIN_ZOOM = 3;
 const MAX_ZOOM = 19;
@@ -13,8 +14,8 @@ const ctx = canvas.getContext('2d');
 const uid = () => (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const POINT_TYPES=['buoy','pin','boat'];
 const normalizeType=type=>POINT_TYPES.includes(type)?type:'buoy';
-const defaultLayout=()=>({windFrom:45,windVisible:true,lineLength:80,legLength:350,leewardOffset:50,autoAlignMarks:true,squareToWind:false});
-const normalizeLayout=x=>({windFrom:Number.isFinite(Number(x?.windFrom))?((Math.round(Number(x.windFrom))%360)+360)%360:45,windVisible:x?.windVisible!==false,lineLength:validLength(x?.lineLength,10,2000,80),legLength:validLength(x?.legLength,10,10000,350),leewardOffset:validLength(x?.leewardOffset,0,2000,50),autoAlignMarks:x?.autoAlignMarks!==false,squareToWind:x?.squareToWind===true});
+const defaultLayout=()=>({windFrom:45,windVisible:true,lineLength:80,legLength:350,leewardOffset:50,autoAlignMarks:true,squareToWind:false,courseType:'wl',rounding:'port',triangleWidth:60});
+const normalizeLayout=x=>({windFrom:Number.isFinite(Number(x?.windFrom))?((Math.round(Number(x.windFrom))%360)+360)%360:45,windVisible:x?.windVisible!==false,lineLength:validLength(x?.lineLength,10,2000,80),legLength:validLength(x?.legLength,10,10000,350),leewardOffset:validLength(x?.leewardOffset,0,2000,50),autoAlignMarks:x?.autoAlignMarks!==false,squareToWind:x?.squareToWind===true,courseType:x?.courseType==='triangle'?'triangle':'wl',rounding:x?.rounding==='starboard'?'starboard':'port',triangleWidth:validLength(x?.triangleWidth,20,120,60)});
 function validLength(value,min,max,fallback){const n=Number(value);return Number.isFinite(n)&&n>=min&&n<=max?n:fallback;}
 const freshCourse = name => ({id:uid(), name, marks:[],layout:defaultLayout()});
 const baseState = () => {const course = freshCourse('My sailing course'); return {version:2,courses:[course], activeCourseId:course.id};};
@@ -27,8 +28,8 @@ function loadState() {
     if(!data || !Array.isArray(data.courses) || !data.courses.length) return baseState();
     const courses = data.courses.filter(c => c && typeof c.id === 'string' && typeof c.name === 'string' && Array.isArray(c.marks)).slice(0,50).map(c => ({
       id:c.id, name:c.name.slice(0,80),layout:normalizeLayout(c.layout), marks:c.marks.filter(m => m && typeof m.id === 'string' && Number.isFinite(m.lat) && Number.isFinite(m.lon) && Math.abs(m.lat)<=90 && Math.abs(m.lon)<=180).slice(0,250).map(m => ({
-        id:m.id, name:String(m.name || 'Mark').slice(0,60), lat:m.lat, lon:m.lon, type:normalizeType(m.type),generatedRole:['windward','leeward'].includes(m.generatedRole)?m.generatedRole:null,
-        laid:m.laid && Number.isFinite(m.laid.lat) && Number.isFinite(m.laid.lon) ? m.laid : null
+        id:m.id, name:String(m.name || 'Mark').slice(0,60), lat:m.lat, lon:m.lon, type:normalizeType(m.type),generatedRole:['windward','leeward','wing'].includes(m.generatedRole)?m.generatedRole:null,
+        laid:m.laid && Number.isFinite(m.laid.lat) && Number.isFinite(m.laid.lon) ? m.laid : null, observed:m.observed && Number.isFinite(m.observed.lat) && Number.isFinite(m.observed.lon) ? m.observed : null
       }))
     }));
     if(!courses.length) return baseState();
@@ -48,6 +49,8 @@ let gpsWatch = null;
 let gpsPoint = null;
 let gpsError = '';
 let followGPS = false;
+let mapStyle = (()=>{try{return localStorage.getItem(MAP_STYLE_KEY)==='satellite'?'satellite':'street';}catch(e){return 'street';}})();
+let placementPreview=null;
 let toastTimer = 0;
 const tileCache = new Map();
 const pointers = new Map();
@@ -144,6 +147,15 @@ function trueBearing(a,b) {
   return (toDeg(Math.atan2(y,x))+360)%360;
 }
 function formatDist(m) {return m<2000?`${Math.round(m)} m`:`${(m/1852).toFixed(2)} NM`;}
+function driftAssessment(mark){
+  if(!mark?.laid||!mark?.observed)return null;
+  const metres=distanceMeters(mark.laid,mark.observed);
+  const uncertainty=Math.max(10,(Number(mark.laid.accuracy)||10)+(Number(mark.observed.accuracy)||10));
+  return {metres,uncertainty,possible:metres>uncertainty};
+}
+function freshGps(){if(!gpsPoint){toast('Start GPS and wait for a fix first.');return null;}if(Date.now()-gpsPoint.time>60000){toast('GPS reading is older than one minute. Wait for a fresh fix.');return null;}return gpsPoint;}
+function dropObservation(mark){mark.laid=null;mark.observed=null;}
+function deleteOneMark(id){const mark=getCourse().marks.find(m=>m.id===id);if(!mark)return;if(!confirm(`Delete ${mark.name}?`))return;getCourse().marks=getCourse().marks.filter(m=>m.id!==id);if(selectedId===id)selectedId=null;mode='browse';save();updateUI();toast(`${mark.name} deleted`);}
 function splitDist(m) {if(m<2000)return [String(Math.round(m)),'m']; return [(m/1852).toFixed(2),'NM'];}
 function prettyCoord(n) {return n.toFixed(6);}
 function isValidCoord(lat,lon) {return Number.isFinite(lat)&&Number.isFinite(lon)&&lat>=-85&&lat<=85&&lon>=-180&&lon<=180;}
@@ -170,7 +182,7 @@ function updateCourseSelect() {
   sel.value=state.activeCourseId;
 }
 function pickMark(id) {
-  selectedId=id; mode='browse'; updateUI();
+  selectedId=id; mode='browse'; placementPreview=null; updateUI();
 }
 function updateUI() {
   const course=getCourse(), selected=getMark();
@@ -179,7 +191,8 @@ function updateUI() {
   $('emptyState').hidden=course.marks.length>0;
   $('editSection').hidden=!selected;
   $('targetName').textContent=selected?selected.name:'Choose a mark';
-  $('targetStatus').textContent=selected?(selected.laid?'Buoy laid':'Target ready'):'No mark selected';
+  const drift=driftAssessment(selected);
+  $('targetStatus').textContent=selected?(drift?.possible?'Possible drift':selected.laid?'Position recorded':'Target ready'):'No mark selected';
   const isAdding=mode==='add',isMoving=mode==='move';
   $('addButton').classList.toggle('active',isAdding);
   $('addButton').innerHTML=isAdding?'× Cancel':'<span class="plus-icon">+</span> Add point';
@@ -194,7 +207,13 @@ function updateUI() {
     $('markLat').value=prettyCoord(selected.lat);
     $('markLon').value=prettyCoord(selected.lon);
     $('laidButton').textContent=selected.laid?'Clear position record':selected.type==='boat'?'Record boat here':'Record mark laid here';
-    $('laidDetail').textContent=selected.laid ? `Recorded at ${prettyCoord(selected.laid.lat)}, ${prettyCoord(selected.laid.lon)}. Offset: ${formatDist(distanceMeters(selected, selected.laid))}.` : selected.type==='boat'?'Record the boat’s actual GPS position once anchored, if useful.':'When you lay the mark, record its actual GPS position to compare with the plan.';
+    $('laidDetail').textContent=selected.laid ? `Laid at ${prettyCoord(selected.laid.lat)}, ${prettyCoord(selected.laid.lon)} (GPS ±${Math.round(selected.laid.accuracy||0)} m). Difference from plan: ${formatDist(distanceMeters(selected, selected.laid))}.` : selected.type==='boat'?'Record the boat’s actual GPS position once anchored, if useful.':'Record the actual position alongside the buoy when first laid.';
+    $('driftBox').hidden=selected.type==='boat';
+    $('checkDrift').disabled=!selected.laid;
+    $('clearDrift').hidden=!selected.observed;
+    const badge=$('driftBadge');badge.className='drift-badge'+(drift?(drift.possible?' warning':' uncertain'):'');
+    badge.textContent=drift?(drift.possible?'POSSIBLE DRIFT':'WITHIN GPS ERROR'):selected.laid?'READY TO CHECK':'NOT RECORDED';
+    $('driftDetail').textContent=drift?`Observed movement: ${formatDist(drift.metres)}. GPS uncertainty threshold: ${formatDist(drift.uncertainty)}. Checked ${new Date(selected.observed.time).toLocaleString()}. ${drift.possible?'Inspect the buoy and repeat the check to confirm.':'This check cannot establish whether it has moved by a smaller distance.'}`:selected.laid?'Return beside the buoy and tap Check at my GPS to compare its position with when laid.':'First record the actual laid position using your GPS. A later check compares against that saved position.';
   }
   $('courseDragButton').classList.toggle('active',mode==='course');
   $('courseDragButton').setAttribute('aria-pressed',String(mode==='course'));
@@ -206,7 +225,14 @@ function updateUI() {
 }
 function renderList() {
   const list=$('markList');list.innerHTML='';
+  const course=getCourse();
+  const w=course.marks.find(m=>m.generatedRole==='windward'),wing=course.marks.find(m=>m.generatedRole==='wing'),lee=course.marks.find(m=>m.generatedRole==='leeward');
+  if(course.layout.courseType==='triangle'&&w&&wing&&lee){
+    const route=[w,wing,lee,w];ctx.save();ctx.strokeStyle='#db6436';ctx.lineWidth=2.3;ctx.setLineDash([9,7]);
+    for(let i=0;i<route.length-1;i++){const a=mapPoint(route[i].lat,route[i].lon),b=mapPoint(route[i+1].lat,route[i+1].lon);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();}ctx.restore();
+  }
   getCourse().marks.forEach((mark,i)=>{
+    const wrapper=document.createElement('div');wrapper.className='mark-item';
     const button=document.createElement('button');
     button.type='button';button.className=`mark-row${selectedId===mark.id?' selected':''}${mark.laid?' laid':''}`;
     const n=document.createElement('span');n.className='mark-number '+(mark.type||'buoy');n.textContent=mark.type==='boat'?'⛵':mark.type==='pin'?'P':String(i+1);
@@ -217,9 +243,13 @@ function renderList() {
     sub.prepend(kind);info.append(title,sub);
     const right=document.createElement('span');right.className='mark-right';
     if(gpsPoint){const dist=document.createElement('span');dist.className='mark-dist';dist.textContent=formatDist(distanceMeters(gpsPoint,mark));right.appendChild(dist);}
-    if(mark.laid){const done=document.createElement('span');done.className='mark-laid';done.textContent='LAID ✓';right.appendChild(done);}
-    button.append(n,info,right);
-    button.addEventListener('click',()=>pickMark(mark.id));list.appendChild(button);
+    const drift=driftAssessment(mark);
+    if(drift){const flag=document.createElement('span');flag.className='mark-drift '+(drift.possible?'warning':'uncertain');flag.textContent=drift.possible?`DRIFT? ${formatDist(drift.metres)}`:`CHECK ${formatDist(drift.metres)}`;right.appendChild(flag);}
+    else if(mark.laid){const done=document.createElement('span');done.className='mark-laid';done.textContent='LAID ✓';right.appendChild(done);}
+    button.append(n,info,right);button.addEventListener('click',()=>pickMark(mark.id));
+    const remove=document.createElement('button');remove.type='button';remove.className='mark-delete';remove.textContent='×';remove.title=`Delete ${mark.name}`;remove.setAttribute('aria-label',`Delete ${mark.name}`);
+    remove.addEventListener('click',()=>deleteOneMark(mark.id));
+    wrapper.append(button,remove);list.appendChild(wrapper);
   });
 }
 function updateNavigation() {
@@ -307,13 +337,13 @@ function requestRender() {
 function getTile(z,x,y) {
   const count=2**z;if(y<0||y>=count)return null;
   const xx=((x%count)+count)%count;
-  const key=`${z}/${xx}/${y}`;
+  const key=`${mapStyle}/${z}/${xx}/${y}`;
   let tile=tileCache.get(key);
   if(!tile) {
     const img=new Image();tile={img,ready:false,error:false};tileCache.set(key,tile);
     img.onload=()=>{tile.ready=true;requestRender();};
     img.onerror=()=>{tile.error=true;requestRender();};
-    img.src=`https://tile.openstreetmap.org/${key}.png`;
+    img.src=mapStyle==='satellite'?`https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${xx}`:`https://tile.openstreetmap.org/${z}/${xx}/${y}.png`;
     if(tileCache.size>350) {for(const [oldKey] of tileCache) {if(tileCache.size<=250)break;tileCache.delete(oldKey);}}
   }
   return tile;
@@ -321,7 +351,7 @@ function getTile(z,x,y) {
 function draw() {
   if(!mapWidth||!mapHeight)return;
   ctx.clearRect(0,0,mapWidth,mapHeight);
-  ctx.fillStyle='#deedf0';ctx.fillRect(0,0,mapWidth,mapHeight);
+  ctx.fillStyle=mapStyle==='satellite'?'#223d42':'#deedf0';ctx.fillRect(0,0,mapWidth,mapHeight);
   const c=worldPoint(view.lat,view.lon,view.zoom);
   const left=c.x-mapWidth/2,top=c.y-mapCenterY();
   const minX=Math.floor(left/TILE_SIZE),minY=Math.floor(top/TILE_SIZE);
@@ -330,7 +360,7 @@ function draw() {
     const sx=Math.round(x*TILE_SIZE-left),sy=Math.round(y*TILE_SIZE-top);
     const tile=getTile(view.zoom,x,y);
     if(tile&&tile.ready)ctx.drawImage(tile.img,sx,sy,TILE_SIZE+0.5,TILE_SIZE+0.5);
-    else {ctx.strokeStyle='#cbdee0';ctx.lineWidth=.7;ctx.strokeRect(sx,sy,TILE_SIZE,TILE_SIZE);}
+    else {ctx.strokeStyle=mapStyle==='satellite'?'#456069':'#cbdee0';ctx.lineWidth=.7;ctx.strokeRect(sx,sy,TILE_SIZE,TILE_SIZE);}
   }
   // Start line and windward guide stay visible even when flowing wind particles are off.
   const {boat,pin}=linePoints();const mid=startMidpoint();
@@ -338,6 +368,7 @@ function draw() {
     const a=mapPoint(boat.lat,boat.lon),b=mapPoint(pin.lat,pin.lon);
     ctx.save();ctx.lineWidth=5;ctx.strokeStyle='#ffffff';ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
     ctx.lineWidth=2.5;ctx.strokeStyle='#176981';ctx.setLineDash([8,6]);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();ctx.restore();
+    drawDistanceLabel((a.x+b.x)/2,(a.y+b.y)/2-21,formatDist(distanceMeters(boat,pin)));
     if(mode==='course'){
       const centre=mapPoint(mid.lat,mid.lon);
       ctx.save();ctx.fillStyle='#107b87';ctx.strokeStyle='#fff';ctx.lineWidth=3;
@@ -352,6 +383,11 @@ function draw() {
     ctx.save();ctx.strokeStyle='rgba(19,128,149,.64)';ctx.setLineDash([7,9]);ctx.lineWidth=1.7;
     ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();ctx.restore();
   }
+  if(placementPreview){
+    const from=placementPreview.from,to=placementPreview.to;
+    ctx.save();ctx.strokeStyle='#ffdf49';ctx.lineWidth=3;ctx.setLineDash([6,5]);ctx.beginPath();ctx.moveTo(from.x,from.y);ctx.lineTo(to.x,to.y);ctx.stroke();ctx.restore();
+    drawDistanceLabel((from.x+to.x)/2,(from.y+to.y)/2-20,formatDist(distanceMeters(placementPreview.boat,placementPreview.geo)));
+  }
   const selected=getMark();
   if(selected&&gpsPoint) {
     const a=mapPoint(gpsPoint.lat,gpsPoint.lon),b=mapPoint(selected.lat,selected.lon);
@@ -359,6 +395,8 @@ function draw() {
     ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();ctx.restore();
   }
   getCourse().marks.forEach((mark,i)=>{
+    const drift=driftAssessment(mark);
+    if(drift){const a=mapPoint(mark.laid.lat,mark.laid.lon),b=mapPoint(mark.observed.lat,mark.observed.lon);ctx.save();ctx.strokeStyle=drift.possible?'#e25143':'#188b8b';ctx.lineWidth=2;ctx.setLineDash([5,4]);ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();ctx.restore();}
     const {x,y}=mapPoint(mark.lat,mark.lon);
     if(x<-90||y<-60||x>mapWidth+90||y>mapHeight+90)return;
     const selectedMark=selectedId===mark.id;
@@ -371,11 +409,12 @@ function draw() {
       ctx.beginPath();ctx.moveTo(0,-13);ctx.lineTo(0,-28);ctx.moveTo(-9,-13);ctx.lineTo(10,-13);ctx.stroke();
       ctx.strokeStyle='#143e54';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(0,-28);ctx.lineTo(-7,-21);ctx.lineTo(0,-21);ctx.stroke();
     } else {
-      ctx.fillStyle=mark.laid?'#22866a':'#e58c35';
+      ctx.fillStyle=mark.type==='pin'?'#f2d529':mark.laid?'#22866a':'#e58c35';
       ctx.beginPath();ctx.moveTo(0,9);ctx.lineTo(-11,-5);ctx.arc(0,-10,13,Math.PI*.78,Math.PI*2.22);ctx.lineTo(11,-5);ctx.closePath();ctx.fill();ctx.stroke();
-      ctx.fillStyle='#fff';ctx.textAlign='center';ctx.textBaseline='middle';ctx.font='bold 13px system-ui,sans-serif';
+      ctx.fillStyle=mark.type==='pin'?'#584b09':'#fff';ctx.textAlign='center';ctx.textBaseline='middle';ctx.font='bold 13px system-ui,sans-serif';
       ctx.fillText(mark.type==='pin'?'P':String(i+1),0,-11);
     }
+    if(mark.laid&&mark.type==='pin'){ctx.fillStyle='#168760';ctx.beginPath();ctx.arc(12,-21,5,0,Math.PI*2);ctx.fill();}
     const label=mark.name.slice(0,24);ctx.font=`${selectedMark?'bold ':''}12px system-ui,sans-serif`;
     const width=ctx.measureText(label).width+14;
     roundRect(ctx,-width/2,14,width,24,6);ctx.fillStyle=selectedMark?'#102b39':'#fff';ctx.fill();
@@ -398,6 +437,7 @@ function draw() {
     ctx.fillText('Offline: chart tiles may be unavailable',23,mapHeight/2);
   }
 }
+function drawDistanceLabel(x,y,label){ctx.save();ctx.font='bold 12px system-ui,sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';const w=ctx.measureText(label).width+18;roundRect(ctx,x-w/2,y-12,w,24,7);ctx.fillStyle='#143946e6';ctx.fill();ctx.fillStyle='#fff';ctx.fillText(label,x,y);ctx.restore();}
 function roundRect(context,x,y,w,h,r) {
   context.beginPath();context.moveTo(x+r,y);context.arcTo(x+w,y,x+w,y+h,r);context.arcTo(x+w,y+h,x,y+h,r);context.arcTo(x,y+h,x,y,r);context.arcTo(x,y,x+w,y,r);context.closePath();
 }
@@ -405,11 +445,11 @@ function pointEvent(e){const rect=canvas.getBoundingClientRect();return{x:e.clie
 function pointerGap(){const p=[...pointers.values()];if(p.length<2)return 0;return Math.hypot(p[0].x-p[1].x,p[0].y-p[1].y);}
 function pointerMid(){const p=[...pointers.values()];return{x:(p[0].x+p[1].x)/2,y:(p[0].y+p[1].y)/2};}
 function handleTap(p) {
-  const geo=geoAt(p.x,p.y);
+  placementPreview=null;const geo=geoAt(p.x,p.y);
   if(mode==='add'){addMark(geo.lat,geo.lon);return;}
   if(mode==='move'){
     const mark=getMark();if(!mark)return;
-    mark.lat=geo.lat;mark.lon=geo.lon;mark.laid=null;if(mark.generatedRole)getCourse().layout.autoAlignMarks=false;mode='browse';save();updateUI();toast(`${mark.name} moved`);return;
+    mark.lat=geo.lat;mark.lon=geo.lon;dropObservation(mark);if(mark.generatedRole)getCourse().layout.autoAlignMarks=false;mode='browse';save();updateUI();toast(`${mark.name} moved`);return;
   }
   const nearest=pointNear(p); 
   if(nearest)pickMark(nearest.id);
@@ -452,7 +492,15 @@ canvas.addEventListener('pointerdown',e=>{
   else if(pointers.size===2){pinchDistance=pointerGap();drag=null;suppressTap=true;}
 });
 canvas.addEventListener('pointermove',e=>{
-  if(!pointers.has(e.pointerId))return;
+  if(!pointers.has(e.pointerId)){
+    const boat=linePoints().boat;
+    if(mode==='add'&&$('addType').value==='pin'&&boat){
+      const cursor=pointEvent(e);
+      placementPreview={boat,geo:geoAt(cursor.x,cursor.y),from:mapPoint(boat.lat,boat.lon),to:cursor};
+      requestRender();
+    }
+    return;
+  }
   const old=pointers.get(e.pointerId);const current=pointEvent(e);
   if(pointers.size===1 && drag){
     if(Math.hypot(current.x-drag.startX,current.y-drag.startY)>6)drag.moved=true;
@@ -471,6 +519,8 @@ canvas.addEventListener('pointermove',e=>{
     return;
   }
   pointers.set(e.pointerId,current);
+  const boat=linePoints().boat;
+  if(mode==='add'&&$('addType').value==='pin'&&boat){placementPreview={boat,geo:geoAt(current.x,current.y),from:mapPoint(boat.lat,boat.lon),to:current};requestRender();}
 });
 function endPointer(e){
   const p=pointers.get(e.pointerId);if(!p)return;
@@ -479,17 +529,18 @@ function endPointer(e){
   const draggedGroup=pointers.size===1&&drag?.moved&&drag.groupDrag;
   pointers.delete(e.pointerId);
   if(draggedGroup){
-    getCourse().marks.filter(m=>m.type==='boat'||m.type==='pin'||m.generatedRole).forEach(m=>m.laid=null);
+    getCourse().marks.filter(m=>m.type==='boat'||m.type==='pin'||m.generatedRole).forEach(dropObservation);
     save();updateUI();toast('Start line and linked marks moved');
   }
   if(draggedMark){
-    draggedMark.laid=null;
+    dropObservation(draggedMark);
     if(draggedMark.generatedRole&&getCourse().layout.autoAlignMarks){getCourse().layout.autoAlignMarks=false;toast('Auto-update paused to preserve manual mark position');}
     else toast(`${draggedMark.name} moved`);
     selectedId=draggedMark.id;save();updateUI();
   }
   if(pointers.size<=1){drag=null;pinchDistance=null;suppressTap=true;}
   if(isTap)handleTap(p);
+  else if(mode==='add')placementPreview=null;
 }
 canvas.addEventListener('pointerup',endPointer);
 canvas.addEventListener('pointercancel',e=>{pointers.delete(e.pointerId);drag=null;pinchDistance=null;suppressTap=true;});
@@ -564,7 +615,7 @@ function importJSON(file){
       if(![1,2].includes(parsed.version)||!Array.isArray(parsed.courses)||!parsed.courses.length)throw new Error('Invalid BuoyPlot backup');
       const normalized=parsed.courses.filter(c=>c&&Array.isArray(c.marks)&&typeof c.name==='string').map(c=>({
         id:uid(),name:c.name.slice(0,80),layout:normalizeLayout(c.layout),marks:c.marks.filter(m=>m&&isValidCoord(Number(m.lat),Number(m.lon))).slice(0,250).map(m=>({
-          id:uid(),name:safeName(m.name)||'Mark',lat:Number(m.lat),lon:Number(m.lon),type:normalizeType(m.type),generatedRole:['windward','leeward'].includes(m.generatedRole)?m.generatedRole:null,laid:m.laid&&isValidCoord(Number(m.laid.lat),Number(m.laid.lon))?{lat:Number(m.laid.lat),lon:Number(m.laid.lon),accuracy:Number(m.laid.accuracy)||0,time:String(m.laid.time||'')}:null
+          id:uid(),name:safeName(m.name)||'Mark',lat:Number(m.lat),lon:Number(m.lon),type:normalizeType(m.type),generatedRole:['windward','leeward','wing'].includes(m.generatedRole)?m.generatedRole:null,laid:m.laid&&isValidCoord(Number(m.laid.lat),Number(m.laid.lon))?{lat:Number(m.laid.lat),lon:Number(m.laid.lon),accuracy:Number(m.laid.accuracy)||0,time:String(m.laid.time||'')}:null,observed:m.observed&&isValidCoord(Number(m.observed.lat),Number(m.observed.lon))?{lat:Number(m.observed.lat),lon:Number(m.observed.lon),accuracy:Number(m.observed.accuracy)||0,time:String(m.observed.time||'')}:null
         }))
       })).slice(0,50);
       if(!normalized.length)throw new Error('No courses found');
@@ -586,6 +637,12 @@ function updateLayoutControls(){
   $('lineLength').value=layout.lineLength;
   $('legLength').value=layout.legLength;
   $('leewardOffset').value=layout.leewardOffset;
+  $('courseType').value=layout.courseType;
+  $('rounding').value=layout.rounding;
+  $('triangleWidth').value=layout.triangleWidth;
+  $('roundingField').hidden=layout.courseType!=='triangle';
+  $('triangleSettings').hidden=layout.courseType!=='triangle';
+  $('generateCourse').textContent=layout.courseType==='triangle'?`Place ${layout.rounding} triangle`:'Place W/L marks';
   $('windBadge').textContent=`${paddedBearing(layout.windFrom)} ${compass(layout.windFrom)}`;
   $('windMapStatus').textContent=`WIND FROM ${paddedBearing(layout.windFrom)} ${compass(layout.windFrom)}`;
   $('windMapStatus').hidden=!layout.windVisible;
@@ -594,16 +651,30 @@ function updateLayoutControls(){
   const current=boat&&pin?`Start line: ${formatDist(distanceMeters(boat,pin))}, bearing ${paddedBearing(trueBearing(boat,pin))}.`:
     !boat&&!pin?'Place a start boat and pin end to define the start line.':`Add ${boat?'the pin end':'the start boat'} to finish the start line.`;
   $('startLineSummary').textContent=current;
+  const readout=$('lineMapReadout');readout.hidden=!(boat&&pin);if(boat&&pin)readout.textContent=`START LINE · ${formatDist(distanceMeters(boat,pin))}`;
   drawWindOverlay();scheduleWindAnimation();
 }
-function syncGeneratedMarks(){
-  const mid=startMidpoint();if(!mid)return;
+function calculatedGeneratedPositions(){
+  const mid=startMidpoint();if(!mid)return [];
   const l=getCourse().layout;
+  const leeward=destination(mid,(l.windFrom+180)%360,l.leewardOffset);
+  const windward=destination(mid,l.windFrom,l.legLength);
+  const result=[{role:'windward',name:l.courseType==='triangle'?'Windward 1':'Windward',pos:windward}];
+  if(l.courseType==='triangle'){
+    // Put the wing on the left for a port-hand course, right for starboard-hand.
+    // Leg length is from the start midpoint to windward; wing is at the halfway latitude.
+    const halfway=destination(leeward,l.windFrom,(l.legLength+l.leewardOffset)/2);
+    const wingBearing=(l.windFrom+(l.rounding==='port'?270:90))%360;
+    result.push({role:'wing',name:'Wing 2',pos:destination(halfway,wingBearing,l.legLength*l.triangleWidth/100)});
+  }
+  result.push({role:'leeward',name:l.courseType==='triangle'?'Leeward 3':'Leeward',pos:leeward});
+  return result;
+}
+function syncGeneratedMarks(){
+  const positions=calculatedGeneratedPositions();
   for(const m of getCourse().marks){
-    let target=null;
-    if(m.generatedRole==='windward')target=destination(mid,l.windFrom,l.legLength);
-    if(m.generatedRole==='leeward')target=destination(mid,(l.windFrom+180)%360,l.leewardOffset);
-    if(target){m.lat=target.lat;m.lon=target.lon;}
+    const target=positions.find(p=>p.role===m.generatedRole);
+    if(target){m.lat=target.pos.lat;m.lon=target.pos.lon;}
   }
 }
 function squareLineAroundMiddle(){
@@ -637,6 +708,7 @@ function syncLayoutNumbers(){
   l.lineLength=validLength($('lineLength').value,10,2000,l.lineLength);
   l.legLength=validLength($('legLength').value,10,10000,l.legLength);
   l.leewardOffset=validLength($('leewardOffset').value,0,2000,l.leewardOffset);
+  l.triangleWidth=validLength($('triangleWidth').value,20,120,l.triangleWidth);
   updateLinkedGeometry({square:true});save();updateUI();
 }
 function drawWindOverlay(){
@@ -682,31 +754,32 @@ function alignPinToWind(){
     return Math.abs(((a-orig+540)%360)-180)-Math.abs(((b-orig+540)%360)-180);
   })[0];
   const next=destination(boat,best,getCourse().layout.lineLength);
-  pin.lat=next.lat;pin.lon=next.lon;pin.laid=null;
+  pin.lat=next.lat;pin.lon=next.lon;dropObservation(pin);
   if(getCourse().layout.autoAlignMarks)syncGeneratedMarks();
   selectedId=pin.id;save();updateUI();fitAll();toast('Pin aligned perpendicular to the wind');
 }
 function generateWL(){
   syncLayoutNumbers();
-  const middle=startMidpoint();if(!middle){toast('Add a start boat and pin end first.');return;}
-  const l=getCourse().layout;
-  const positions=[{role:'windward',name:'Windward',pos:destination(middle,l.windFrom,l.legLength)},
-                   {role:'leeward',name:'Leeward',pos:destination(middle,(l.windFrom+180)%360,l.leewardOffset)}];
-  const needed=positions.filter(item=>!getCourse().marks.some(m=>m.generatedRole===item.role)).length;
+  const positions=calculatedGeneratedPositions();if(!positions.length){toast('Add a start boat and pin end first.');return;}
+  const course=getCourse();
+  const needed=positions.filter(p=>!course.marks.some(m=>m.generatedRole===p.role)).length;
   if(maxPointsReached(needed))return;
-  if(positions.some(item=>getCourse().marks.some(m=>m.generatedRole===item.role))&&!confirm('Update the existing generated windward/leeward positions? This replaces their planned coordinates.'))return;
+  const existing=positions.some(p=>course.marks.some(m=>m.generatedRole===p.role));
+  if(existing&&!confirm('Rebuild the generated course? This replaces generated mark positions and their laid/drift records.'))return;
   for(const item of positions){
-    let mark=getCourse().marks.find(m=>m.generatedRole===item.role);
-    if(mark){mark.lat=item.pos.lat;mark.lon=item.pos.lon;mark.laid=null;mark.type='buoy';}
-    else getCourse().marks.push({id:uid(),name:item.name,lat:item.pos.lat,lon:item.pos.lon,type:'buoy',laid:null,generatedRole:item.role});
+    let mark=course.marks.find(m=>m.generatedRole===item.role);
+    if(mark){mark.lat=item.pos.lat;mark.lon=item.pos.lon;mark.name=item.name;dropObservation(mark);mark.type='buoy';}
+    else course.marks.push({id:uid(),name:item.name,lat:item.pos.lat,lon:item.pos.lon,type:'buoy',laid:null,observed:null,generatedRole:item.role});
   }
-  save();selectedId=getCourse().marks.find(m=>m.generatedRole==='windward')?.id||null;updateUI();fitAll();toast('Windward and leeward marks positioned');
+  if(getCourse().layout.courseType==='wl')course.marks=course.marks.filter(m=>m.generatedRole!=='wing');
+  save();selectedId=course.marks.find(m=>m.generatedRole==='windward')?.id||null;updateUI();fitAll();
+  toast(getCourse().layout.courseType==='triangle'?`${getCourse().layout.rounding} triangle course positioned`:'Windward and leeward marks positioned');
 }
 $('windDirection').addEventListener('change',e=>{if(e.target.value==='')return;setWindDirection(e.target.value);});
 $('windSlider').addEventListener('input',e=>setWindDirection(e.target.value));
 document.querySelectorAll('[data-wind]').forEach(btn=>btn.addEventListener('click',()=>setWindDirection(btn.dataset.wind)));
 $('windVisible').addEventListener('change',e=>{getCourse().layout.windVisible=e.target.checked;save();updateLayoutControls();});
-for(const id of ['lineLength','legLength','leewardOffset']) $(id).addEventListener('change',syncLayoutNumbers);
+for(const id of ['lineLength','legLength','leewardOffset','triangleWidth']) $(id).addEventListener('change',syncLayoutNumbers);
 $('alignPin').addEventListener('click',alignPinToWind);
 $('squareLine').addEventListener('click',()=>{
   syncLayoutNumbers();if(!squareLineAroundMiddle()){toast('Place a start boat and pin first.');return;}
@@ -724,6 +797,8 @@ $('squareToWind').addEventListener('change',e=>{
 $('planModeToggle').addEventListener('click',toggleCourseDrag);
 $('courseDragButton').addEventListener('click',toggleCourseDrag);
 $('generateCourse').addEventListener('click',generateWL);
+$('courseType').addEventListener('change',e=>{getCourse().layout.courseType=e.target.value==='triangle'?'triangle':'wl';updateLinkedGeometry();save();updateUI();});
+$('rounding').addEventListener('change',e=>{getCourse().layout.rounding=e.target.value==='starboard'?'starboard':'port';updateLinkedGeometry();save();updateUI();});
 document.addEventListener('visibilitychange',()=>{if(!document.hidden){windLast=0;scheduleWindAnimation();}});
 
 // --- Controls ---
@@ -741,9 +816,9 @@ $('renameCourse').addEventListener('click',()=>{
   if(!safeName(name)){toast('Please enter a course name.');return;}
   c.name=safeName(name);save();updateCourseSelect();toast('Course renamed');
 });
-$('addButton').addEventListener('click',()=>{mode=mode==='add'?'browse':'add';updateUI();});
+$('addButton').addEventListener('click',()=>{mode=mode==='add'?'browse':'add';placementPreview=null;updateUI();});
 $('moveButton').addEventListener('click',()=>{if(!getMark())return;mode=mode==='move'?'browse':'move';updateUI();if(mode==='move'&&window.innerWidth<=760)setSheetState('peek');});
-$('addType').addEventListener('change',()=>{if(mode==='add')updateUI();});
+$('addType').addEventListener('change',()=>{placementPreview=null;if(mode==='add')updateUI();});
 $('saveMark').addEventListener('click',()=>{
   const mark=getMark();if(!mark)return;
   const name=safeName($('markName').value),lat=Number($('markLat').value),lon=Number($('markLon').value);
@@ -755,26 +830,47 @@ $('saveMark').addEventListener('click',()=>{
   if(nextType!=='buoy'&&getCourse().marks.some(m=>m.id!==mark.id&&m.type===nextType)){toast(`Only one ${typeLabel(nextType).toLowerCase()} per course.`);return;}
   mark.name=name;mark.lat=lat;mark.lon=lon;mark.type=nextType;mark.generatedRole=null;save();updateUI();toast('Point updated');
 });
-$('deleteMark').addEventListener('click',()=>{
-  const mark=getMark();if(!mark)return;
-  if(!confirm(`Delete ${mark.name}?`))return;
-  getCourse().marks=getCourse().marks.filter(m=>m.id!==mark.id);
-  selectedId=null;mode='browse';save();updateUI();toast('Mark deleted');
+$('deleteMark').addEventListener('click',()=>{if(selectedId)deleteOneMark(selectedId);});
+$('clearMarks').addEventListener('click',()=>{
+  const course=getCourse(),n=course.marks.length;if(!n){toast('This course has no points to clear.');return;}
+  if(!confirm(`Delete all ${n} points from “${course.name}”? This cannot be undone unless you have a JSON backup.`))return;
+  course.marks=[];selectedId=null;mode='browse';placementPreview=null;save();updateUI();toast(`Cleared ${n} course points`);
 });
 $('atGpsButton').addEventListener('click',()=>{
   const mark=getMark();if(!mark)return;
   if(!gpsPoint){toast('Start GPS and wait for a fix first.');return;}
   if(gpsPoint.accuracy>25&&!confirm(`GPS accuracy is ±${Math.round(gpsPoint.accuracy)} m. Move this point anyway?`))return;
-  mark.lat=gpsPoint.lat;mark.lon=gpsPoint.lon;mark.laid=null;if(mark.generatedRole)getCourse().layout.autoAlignMarks=false;save();updateUI();toast(`${mark.name} moved to GPS position`);
+  mark.lat=gpsPoint.lat;mark.lon=gpsPoint.lon;dropObservation(mark);if(mark.generatedRole)getCourse().layout.autoAlignMarks=false;save();updateUI();toast(`${mark.name} moved to GPS position`);
 });
 $('laidButton').addEventListener('click',()=>{
   const mark=getMark();if(!mark)return;
-  if(mark.laid){if(!confirm(`Clear the actual laid position for ${mark.name}?`))return;mark.laid=null;save();updateUI();return;}
+  if(mark.laid){if(!confirm(`Clear the actual laid position for ${mark.name}?`))return;dropObservation(mark);save();updateUI();return;}
   if(!gpsPoint){toast('Start GPS and wait for a location fix first.');return;}
   if(gpsPoint.accuracy>25&&!confirm(`GPS accuracy is only ±${Math.round(gpsPoint.accuracy)} m. Record this position anyway?`))return;
-  mark.laid={lat:gpsPoint.lat,lon:gpsPoint.lon,accuracy:gpsPoint.accuracy,time:new Date().toISOString()};
+  if(!freshGps())return;
+  mark.laid={lat:gpsPoint.lat,lon:gpsPoint.lon,accuracy:gpsPoint.accuracy,time:new Date().toISOString()};mark.observed=null;
   save();updateUI();toast(`Laid position recorded (${formatDist(distanceMeters(mark,mark.laid))} from target)`);
 });
+$('checkDrift').addEventListener('click',()=>{
+  const mark=getMark();if(!mark||!mark.laid){toast('Record the laid position before checking drift.');return;}
+  const fix=freshGps();if(!fix)return;
+  if(fix.accuracy>25&&!confirm(`GPS accuracy is ±${Math.round(fix.accuracy)} m. Record this check anyway?`))return;
+  mark.observed={lat:fix.lat,lon:fix.lon,accuracy:fix.accuracy,time:new Date().toISOString()};
+  const result=driftAssessment(mark);save();updateUI();
+  toast(result.possible?`Possible drift: ${formatDist(result.metres)}. Check again to confirm.`:`Check complete: ${formatDist(result.metres)}, within GPS uncertainty.`);
+});
+$('clearDrift').addEventListener('click',()=>{const mark=getMark();if(!mark||!mark.observed)return;if(!confirm('Clear this latest drift check?'))return;mark.observed=null;save();updateUI();});
+function updateMapStyle(){
+  const isSatellite=mapStyle==='satellite';
+  $('mapStyleButton').textContent=isSatellite?'MAP':'SAT';
+  $('mapStyleButton').classList.toggle('active',isSatellite);
+  $('mapStyleButton').setAttribute('aria-pressed',String(isSatellite));
+  $('mapStyleButton').setAttribute('aria-label',isSatellite?'Switch to street map':'Switch to satellite map');
+  $('mapStyleButton').title=isSatellite?'Switch to street map':'Switch to satellite map';
+  $('mapAttribution').innerHTML=isSatellite?'Imagery © <a href="https://www.esri.com/en-us/legal/terms/web-site-service" target="_blank" rel="noopener noreferrer">Esri</a>, Maxar, Earthstar Geographics, GIS User Community':'© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> contributors';
+  requestRender();
+}
+$('mapStyleButton').addEventListener('click',()=>{mapStyle=mapStyle==='street'?'satellite':'street';try{localStorage.setItem(MAP_STYLE_KEY,mapStyle);}catch(e){}updateMapStyle();toast(mapStyle==='satellite'?'Satellite imagery enabled (internet required)':'Street map enabled');});
 $('gpsButton').addEventListener('click',()=>gpsWatch===null?startGps():stopGps());
 $('centreButton').addEventListener('click',()=>{
   if(!gpsPoint){toast('Start GPS to centre on your position.');return;}
@@ -794,5 +890,5 @@ if(window.ResizeObserver)new ResizeObserver(resize).observe(canvas);
 if('serviceWorker' in navigator && window.isSecureContext)navigator.serviceWorker.register('./sw.js').catch(()=>{});
 
 // Initialise. If the device has a saved course, show the marks instead of the default harbour view.
-setSheetState('peek');updateCourseSelect();updateUI();resize();
+setSheetState('peek');updateCourseSelect();updateMapStyle();updateUI();resize();
 if(getCourse().marks.length)fitAll();
