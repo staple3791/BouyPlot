@@ -4,19 +4,10 @@ A free, installable web app for planning a sailing course, positioning start-lin
 
 **Version 3** adds a nearly full-screen map on iPhone with a draggable control panel, interactive course moving and automatic wind-relative course updates. Version 2 also introduced wind flow, a start boat/pin end, start-line alignment and windward/leeward mark placement. Existing Version 1 and Version 2 saved courses remain available when you update the same website.
 
-## Install / publish (GitHub Pages)
-
-1. Create a **public** GitHub repository named `buoyplot` (or another name).
-2. Upload every file in this folder into the repository root, including `index.html`, `app.js`, `styles.css`, icons, `sw.js` and `manifest.webmanifest`.
-3. Open the repository's **Settings > Pages**. Under **Build and deployment**, choose **Deploy from a branch**, the `main` branch and the `/ (root)` folder, then save.
-4. Open `https://YOUR-USERNAME.github.io/buoyplot/` on the iPhone using Safari. Your actual URL uses your selected repository name.
+## Install
+4. Open `https://staple3791.github.io/BouyPlot/` on the iPhone using Safari. Your actual URL uses your selected repository name.
 5. In Safari, use **Share > Add to Home Screen** and enable **Open as Web App** if offered. Allow location access when prompted.
 
-GPS location requires a secure (HTTPS) origin. Opening `index.html` as a local `file://` page is useful for viewing but may not allow GPS or service workers. GitHub Pages serves over HTTPS.
-
-## Upgrading an existing GitHub Pages deployment
-
-Keep the **same** GitHub repository and website URL. Replace its `index.html`, `app.js`, `styles.css`, `sw.js`, `README.md`, and other files with the ones in this ZIP. The app uses the same device storage key (`buoyplot-courses-v1`) and migrates existing saved courses automatically. Previous JSON backups are also supported. Version 3 uses a new service-worker cache; if the old interface still opens immediately after uploading, close/reopen the Home Screen app and refresh in Safari while online. iOS Safari may need a refresh or closing/reopening the Home Screen app for the new service worker cache to take over. Back up your courses first.
 
 ## Map-first layout (iPhone)
 
